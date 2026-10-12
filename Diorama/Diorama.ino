@@ -2,7 +2,7 @@
   Silvestre del Moro Park — Diorama Controller v4
   ESP32 + ILI9488 480×320 + XPT2046 touch + rotary encoder + WiFi HTTP server
 
-  TFT scope  : Gate access screen  |  Lights (Basic / Sound / Adaptive)  |  Audio (temporarily disabled)
+  TFT scope  : Gate access screen  |  Lights (Basic / Sound / Adaptive)  |  Audio via slave ESP32
   Web App    : Full control via HTTP GET endpoints (same ESP32 state)
 
   ── Wiring ──────────────────────────────────────────────────────────────────
@@ -12,8 +12,8 @@
   Rotary      : CLK 25, DT 26, SW 27
   TB6612FNG   : PWMA + PWMB -> GPIO 13 (shared pump speed); AIN1/BIN1 -> 3V3,
                 AIN2/BIN2 -> GND, STBY -> 3V3. Use an external pump supply.
-  SD/I2S      : Temporarily disabled; SD pin assignments need review before enabling.
-  Mic         : GPIO 35  (ADC1 input-only analog; SD is disabled)
+  SD/audio    : SD card and PAM8403 are on the slave ESP32; main proxies audio controls.
+  Mic         : GPIO 35  (ADC1 input-only analog)
   RGB LEDs    : driven by the slave ESP32; main forwards RGB/mode commands
   Shared I2C bus: ESP32 SDA=32, SCL=33 -> VEML7700 and PCA9685 SDA/SCL
   Color controller UART1: Nano TX -> ESP32 GPIO 34 (D34), 9600 baud
@@ -35,12 +35,12 @@
   GET /api/drainage-pump?state=on|off
   GET /api/gate?state=open|closed
   GET /api/gate/status                          → {"open":true|false}
-  GET /api/audio/play?file=xxx.mp3
+  GET /api/audio/play?file=/DIORAMA/xxx.mp3
   GET /api/audio/pause
   GET /api/audio/stop
   GET /api/audio/volume?volume=0-100
-  GET /api/audio/files                          → {"files":["001.mp3",...]}
-  Note: Audio control endpoints return 503 while SD_AUDIO_ENABLED is false.
+  GET /api/audio/files                          → {"files":["/DIORAMA/001.mp3",...]}
+  Note: Audio endpoints proxy to the slave ESP32 and return an error if it is unavailable.
   GET /api/sound-reactive?state=on|off&intensity=0-100
   GET /api/sound                                → {"detected":bool,"level":0-1023}
 */
@@ -84,10 +84,8 @@ struct FingerprintUser {
 // ── Libraries ────────────────────────────────────────────────────────────────
 #include <TFT_eSPI.h>
 #include <SPI.h>
-#include <SD.h>
 #include <FS.h>
 #include <SPIFFS.h>
-#include "Audio.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
@@ -109,19 +107,10 @@ struct FingerprintUser {
 #define WIFI_AP_PASS  "diorama123"   // min 8 chars; set "" for open network
 
 // ── Pins ─────────────────────────────────────────────────────────────────────
-#define SD_SCK    14
-#define SD_MISO   35  // Conflicts with MIC_PIN; reassign before enabling SD/audio.
-#define SD_MOSI  25  // Unused while SD_AUDIO_ENABLED is false; reassign before enabling.
-#define SD_CS     13  // Conflicts with shared pump PWM; reassign before enabling SD.
-#define I2S_BCLK  26  // Unused while SD_AUDIO_ENABLED is false; reassign before enabling.
-#define I2S_LRC   27  // Unused while SD_AUDIO_ENABLED is false; reassign before enabling.
-#define I2S_DOUT  22  // Audio is disabled; color UART is receive-only.
 #define MIC_PIN   35
 #define ENCODER_CLK_PIN 25
 #define ENCODER_DT_PIN  26
 #define ENCODER_SW_PIN  27
-
-constexpr bool SD_AUDIO_ENABLED = false;
 
 #define I2C_SDA_PIN 32  // Shared by the ambient sensor and PWM extender
 #define I2C_SCL_PIN 33
@@ -159,8 +148,6 @@ void runInnerCircle(bool = true) {
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 TFT_eSPI   tft = TFT_eSPI();
-SPIClass   sdSPI(HSPI);
-Audio      audio;
 WebServer  server(80);
 
 // Fingerprint sensor
@@ -242,7 +229,7 @@ int     hue = 36, sat = 46;
 bool    colorScanMode = true;
 
 // Fountain
-constexpr int MAX_FOUNTAIN_PWM = 215;
+constexpr int MAX_FOUNTAIN_PWM = 100;
 bool    fountainOn  = false;
 int     fountainStr = 100;  // 0-100
 int     fountainAux = 100;  // Mirrors shared speed for compatibility with the UI state.
@@ -267,11 +254,14 @@ const uint32_t GOODBYE_MS = 3000;
 
 // Audio
 #define MAX_TRACKS 24
-char     trackPath[MAX_TRACKS][48];
+char     trackPath[MAX_TRACKS][96];
 int      trackCount = 0, curTrack = 0;
 int      volume     = 60;   // 0-100
 bool     sdOk = false, audioPlaying = false, audioStarted = false;
 uint32_t trackStartMs = 0;
+bool     slaveAudioReachable = false;
+uint32_t lastSlaveAudioSyncMs = 0;
+uint32_t lastSlaveAudioListMs = 0;
 
 // TFT page / mode
 Page  page      = P_LIGHTS;
@@ -342,7 +332,7 @@ void startEnrollment();
 bool deleteUser(int fpID);
 void togglePlay();
 void stepTrack(int direction);
-int volToAudio(int v);
+bool sendSlaveAudioCommand(const String& endpoint);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SLAVE ESP32 COMMUNICATION
@@ -1625,13 +1615,14 @@ void drawAudio() {
 
   // Track info
   if (!sdOk) {
-    txt("SD card not found", W / 2, BODY_Y + 28, 4, C_RED, C_BG, MC_DATUM);
+    txt("Slave SD unavailable", W / 2, BODY_Y + 28, 4, C_RED, C_BG, MC_DATUM);
   } else if (!trackCount) {
-    txt("No audio files on SD", W / 2, BODY_Y + 28, 4, C_AMBER, C_BG, MC_DATUM);
+    txt("No MP3/WAV files in /DIORAMA", W / 2, BODY_Y + 28, 2, C_AMBER, C_BG, MC_DATUM);
   } else {
-    // Shorten filename: strip path and extension, truncate at 26 chars
+    // Show the current track filename without its folder and extension.
     char title[48];
-    strlcpy(title, trackPath[curTrack] + 1, sizeof(title));
+    const char* filename = strrchr(trackPath[curTrack], '/');
+    strlcpy(title, filename ? filename + 1 : trackPath[curTrack], sizeof(title));
     char* dot = strrchr(title, '.'); if (dot) *dot = 0;
     if (strlen(title) > 26) { title[24] = '.'; title[25] = '.'; title[26] = 0; }
 
@@ -2027,7 +2018,7 @@ void applyEncoderStep(int direction) {
 
     case ENC_CONTROL_VOLUME:
       volume = constrain(volume + direction * 5, 0, 100);
-      if (SD_AUDIO_ENABLED) audio.setVolume(volToAudio(volume));
+      sendSlaveAudioCommand("/audio/volume?volume=" + String(volume));
       if (page == P_AUDIO) drawAudio();
       break;
 
@@ -2336,64 +2327,183 @@ void updateLive() {
 // AUDIO HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-int volToAudio(int v) { return map(v, 0, 100, 0, 21); }
+bool requestSlaveAudio(const String& endpoint, String& body, int& statusCode) {
+  WiFiClient client;
+  client.setTimeout(300);
+  if (!client.connect(IPAddress(192, 168, 4, 200), 80, 500)) return false;
 
-void scanTracks() {
+  client.print("GET ");
+  client.print(endpoint);
+  client.print(" HTTP/1.0\r\nHost: 192.168.4.200\r\nConnection: close\r\n\r\n");
+
+  const uint32_t startedAt = millis();
+  while (!client.available() && client.connected() && millis() - startedAt < 700) delay(1);
+  if (!client.available()) {
+    client.stop();
+    return false;
+  }
+
+  const String statusLine = client.readStringUntil('\n');
+  statusCode = statusLine.length() >= 12 ? statusLine.substring(9, 12).toInt() : 0;
+  while (client.connected() || client.available()) {
+    if (!client.available()) {
+      if (millis() - startedAt >= 1200) break;
+      delay(1);
+      continue;
+    }
+    String header = client.readStringUntil('\n');
+    if (header == "\r" || header.length() == 0) break;
+  }
+
+  body = "";
+  const uint32_t bodyStartedAt = millis();
+  while (client.connected() || client.available()) {
+    while (client.available()) body += static_cast<char>(client.read());
+    if (millis() - bodyStartedAt >= 1200) break;
+    delay(1);
+  }
+  client.stop();
+  return statusCode >= 200 && statusCode < 300;
+}
+
+String encodeAudioPath(const char* path) {
+  String encoded;
+  for (const unsigned char* p = reinterpret_cast<const unsigned char*>(path); *p; ++p) {
+    const unsigned char ch = *p;
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+        (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+      encoded += static_cast<char>(ch);
+    } else {
+      char escaped[4];
+      snprintf(escaped, sizeof(escaped), "%%%02X", ch);
+      encoded += escaped;
+    }
+  }
+  return encoded;
+}
+
+bool sendSlaveAudioCommand(const String& endpoint) {
+  String response;
+  int statusCode = 0;
+  const bool ok = requestSlaveAudio(endpoint, response, statusCode);
+  if (!ok) Serial.printf("[AUDIO] Slave command failed: %s (HTTP %d)\n", endpoint.c_str(), statusCode);
+  return ok;
+}
+
+void refreshSlaveAudioTracks() {
+  lastSlaveAudioListMs = millis();
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/files", response, statusCode)) {
+    slaveAudioReachable = false;
+    sdOk = false;
+    return;
+  }
+
+  StaticJsonDocument<4096> doc;
+  if (deserializeJson(doc, response)) {
+    Serial.println("[AUDIO] ERROR: invalid track-list response from slave");
+    return;
+  }
+
+  slaveAudioReachable = true;
+  sdOk = doc["sdCardReady"] | false;
+  JsonArrayConst files = doc["files"].as<JsonArrayConst>();
   trackCount = 0;
-  File root = SD.open("/");
-  if (!root) return;
-  File f = root.openNextFile();
-  while (f && trackCount < MAX_TRACKS) {
-    if (!f.isDirectory()) {
-      String n = f.name();
-      if (n.startsWith("/")) n.remove(0, 1);
-      String l = n; l.toLowerCase();
-      if (n[0] != '.' && (l.endsWith(".mp3") || l.endsWith(".wav") ||
-                          l.endsWith(".aac") || l.endsWith(".m4a") || l.endsWith(".flac"))) {
-        snprintf(trackPath[trackCount++], 48, "/%s", n.c_str());
+  for (JsonVariantConst file : files) {
+    if (trackCount >= MAX_TRACKS) break;
+    const char* path = file.as<const char*>();
+    if (path && *path) strlcpy(trackPath[trackCount++], path, sizeof(trackPath[0]));
+  }
+  lastSlaveAudioListMs = millis();
+}
+
+void syncSlaveAudioState() {
+  const uint32_t now = millis();
+  if (now - lastSlaveAudioSyncMs < 1200) return;
+  lastSlaveAudioSyncMs = now;
+
+  if (!slaveAudioReachable && now - lastSlaveAudioListMs < 5000) return;
+  if (!slaveAudioReachable || now - lastSlaveAudioListMs >= 5000) {
+    refreshSlaveAudioTracks();
+  }
+  if (!slaveAudioReachable) return;
+
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/state", response, statusCode)) {
+    slaveAudioReachable = false;
+    sdOk = false;
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, response)) {
+    Serial.println("[AUDIO] ERROR: invalid playback-state response from slave");
+    return;
+  }
+
+  const bool wasReady = sdOk;
+  const bool wasPlaying = audioPlaying;
+  const int oldTrack = curTrack;
+  const uint8_t oldVolume = volume;
+  char previousTrack[sizeof(trackPath[0])];
+  previousTrack[0] = '\0';
+  if (audioStarted && curTrack >= 0 && curTrack < trackCount) {
+    strlcpy(previousTrack, trackPath[curTrack], sizeof(previousTrack));
+  }
+
+  slaveAudioReachable = true;
+  sdOk = doc["sdCardReady"] | false;
+  audioPlaying = doc["playing"] | false;
+  volume = constrain(doc["volume"] | volume, 0, 100);
+  const char* currentPath = doc["track"] | "";
+  audioStarted = currentPath[0] != '\0';
+  if (audioStarted) {
+    for (int i = 0; i < trackCount; ++i) {
+      if (strcmp(trackPath[i], currentPath) == 0) {
+        curTrack = i;
+        break;
       }
     }
-    f.close();
-    f = root.openNextFile();
   }
-  root.close();
-  for (int i = 0; i < trackCount - 1; i++)
-    for (int j = i + 1; j < trackCount; j++)
-      if (strcasecmp(trackPath[i], trackPath[j]) > 0) {
-        char t[48]; strcpy(t, trackPath[i]);
-        strcpy(trackPath[i], trackPath[j]);
-        strcpy(trackPath[j], t);
-      }
+
+  const bool trackChanged = audioStarted
+    ? strcmp(previousTrack, currentPath) != 0
+    : previousTrack[0] != '\0';
+  if (page == P_AUDIO &&
+      (wasReady != sdOk || wasPlaying != audioPlaying ||
+       oldTrack != curTrack || oldVolume != volume || trackChanged)) {
+    drawAudio();
+  }
 }
 
 void startTrack(int i) {
-  if (!trackCount) return;
-  curTrack = i;
-  audio.connecttoFS(SD, trackPath[i]);
-  audioPlaying = audioStarted = true;
-  trackStartMs = millis();
-  Serial.printf("[AUDIO] Playing %d/%d: %s\n", curTrack + 1, trackCount, trackPath[i]);
+  if (i < 0 || i >= trackCount) return;
+  const String endpoint = "/audio/play?file=" + encodeAudioPath(trackPath[i]);
+  if (sendSlaveAudioCommand(endpoint)) {
+    curTrack = i;
+    audioPlaying = audioStarted = true;
+    trackStartMs = millis();
+    Serial.printf("[AUDIO] Playing %d/%d: %s\n", curTrack + 1, trackCount, trackPath[i]);
+  }
 }
 
 void togglePlay() {
   if (!trackCount) return;
-  if (!audioStarted) { startTrack(curTrack); return; }
-  audio.pauseResume();
-  audioPlaying = !audioPlaying;
-}
-
-void stepTrack(int d) {
-  if (!trackCount) return;
-  int n = (curTrack + d + trackCount) % trackCount;
-  if (audioStarted) startTrack(n); else curTrack = n;
-}
-
-void autoAdvance() {
-  if (audioPlaying && audioStarted &&
-      millis() - trackStartMs > 1000 && !audio.isRunning()) {
-    stepTrack(1);
-    if (page == P_AUDIO) drawAudio();
+  if (audioPlaying) {
+    if (sendSlaveAudioCommand("/audio/pause")) audioPlaying = false;
+  } else {
+    const int selected = audioStarted ? curTrack : 0;
+    startTrack(selected);
   }
+}
+
+void stepTrack(int direction) {
+  if (!trackCount) return;
+  const int next = (curTrack + direction + trackCount) % trackCount;
+  curTrack = next;
+  if (audioStarted) startTrack(next);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2672,7 +2782,7 @@ void onDrag(int x) {
         drawSlider(BODY_Y + 200, p, C_GREEN);
         drawEncoderFocusCue(SL_X0, BODY_Y + 182, SL_X1 - SL_X0, 36,
                             encoderControl == ENC_CONTROL_VOLUME);
-        if (SD_AUDIO_ENABLED) audio.setVolume(volToAudio(p));
+        sendSlaveAudioCommand("/audio/volume?volume=" + String(p));
       }
       break;
 
@@ -2959,94 +3069,100 @@ void handleGateStatus() {
 
 // ── GET /api/audio/play?file=xxx.mp3 ─────────────────────────────────────────
 void handleAudioPlay() {
-  if (!SD_AUDIO_ENABLED) {
-    server.send(503, "application/json", "{\"error\":\"audio is temporarily disabled\"}");
-    return;
-  }
   if (!server.hasArg("file")) { server.send(400, "application/json", "{\"error\":\"missing file\"}"); return; }
-  String file = "/" + server.arg("file");
-  if (!file.startsWith("/")) file = "/" + file;
-
-  Serial.printf("[HTTP /api/audio/play] file=%s\n", file.c_str());
-  // Find track index matching filename
-  for (int i = 0; i < trackCount; i++) {
-    if (String(trackPath[i]) == file || String(trackPath[i]) == server.arg("file")) {
-      startTrack(i);
-      if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
-      jsonOk();
-      return;
+  const String requested = server.arg("file");
+  int index = -1;
+  for (int i = 0; i < trackCount; ++i) {
+    const char* name = strrchr(trackPath[i], '/');
+    if (requested == trackPath[i] || requested == (name ? name + 1 : trackPath[i])) {
+      index = i;
+      break;
     }
   }
-  // File not in list — play directly
-  audio.connecttoFS(SD, file.c_str());
+  if (index < 0) {
+    server.send(404, "application/json", "{\"error\":\"track not found in slave /DIORAMA playlist\"}");
+    return;
+  }
+
+  const String endpoint = "/audio/play?file=" + encodeAudioPath(trackPath[index]);
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio(endpoint, response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
+    return;
+  }
+  curTrack = index;
   audioPlaying = audioStarted = true;
   trackStartMs = millis();
   if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
-  jsonOk();
+  server.send(statusCode, "application/json", response);
 }
 
 // ── GET /api/audio/pause ─────────────────────────────────────────────────────
 void handleAudioPause() {
   Serial.println("[HTTP /api/audio/pause]");
-  if (!SD_AUDIO_ENABLED) {
-    server.send(503, "application/json", "{\"error\":\"audio is temporarily disabled\"}");
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/pause", response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
     return;
   }
-  if (audioStarted && audioPlaying) {
-    audio.pauseResume();
-    audioPlaying = false;
-    if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
-  }
-  jsonOk();
+  audioPlaying = false;
+  if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
+  server.send(statusCode, "application/json", response);
 }
 
 // ── GET /api/audio/stop ──────────────────────────────────────────────────────
 void handleAudioStop() {
   Serial.println("[HTTP /api/audio/stop]");
-  if (!SD_AUDIO_ENABLED) {
-    server.send(503, "application/json", "{\"error\":\"audio is temporarily disabled\"}");
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/stop", response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
     return;
   }
-  audio.stopSong();
   audioPlaying = audioStarted = false;
   if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
-  jsonOk();
+  server.send(statusCode, "application/json", response);
 }
 
 // ── GET /api/audio/volume?volume=0-100 ───────────────────────────────────────
 void handleAudioVolume() {
-  if (!SD_AUDIO_ENABLED) {
-    server.send(503, "application/json", "{\"error\":\"audio is temporarily disabled\"}");
+  if (!server.hasArg("volume")) {
+    server.send(400, "application/json", "{\"error\":\"missing volume\"}");
     return;
   }
-  if (server.hasArg("volume")) {
-    volume = constrain(server.arg("volume").toInt(), 0, 100);
-    audio.setVolume(volToAudio(volume));
-    Serial.printf("[HTTP /api/audio/volume] volume=%d\n", volume);
-    if (page == P_AUDIO && gateState == GS_OPEN) {
-      drawPct(W - 10, BODY_Y + 166, volume, C_GREEN);
-      drawSlider(BODY_Y + 200, volume, C_GREEN);
-    }
+  const int requestedVolume = constrain(server.arg("volume").toInt(), 0, 100);
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/volume?volume=" + String(requestedVolume), response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
+    return;
   }
-  jsonOk();
+  volume = requestedVolume;
+  Serial.printf("[HTTP /api/audio/volume] volume=%d\n", volume);
+  if (page == P_AUDIO && gateState == GS_OPEN) {
+    drawPct(W - 10, BODY_Y + 166, volume, C_GREEN);
+    drawSlider(BODY_Y + 200, volume, C_GREEN);
+  }
+  server.send(statusCode, "application/json", response);
 }
 
-// ── GET /api/audio/files  → {"files":["001.mp3",...]} ────────────────────────
+// ── GET /api/audio/files → list of files found on the slave SD card ──────────
 void handleAudioFiles() {
-  if (!SD_AUDIO_ENABLED) {
-    server.send(200, "application/json", "{\"files\":[]}");
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/files", response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave SD/audio controller unavailable\",\"files\":[]}");
     return;
   }
-  String json = "{\"files\":[";
-  for (int i = 0; i < trackCount; i++) {
-    if (i) json += ",";
-    // Return filename without leading slash
-    String p = String(trackPath[i]);
-    if (p.startsWith("/")) p.remove(0, 1);
-    json += "\"" + p + "\"";
-  }
-  json += "]}";
-  server.send(200, "application/json", json);
+  refreshSlaveAudioTracks();
+  server.send(statusCode, "application/json", response);
 }
 
 // ── GET /api/sound-reactive?state=on|off&intensity=0-100 ─────────────────────
@@ -3102,18 +3218,17 @@ void handleState() {
   snprintf(rightHex,  sizeof(rightHex),  "#%02X%02X%02X", zone[1].r, zone[1].g, zone[1].b);
   snprintf(centerHex, sizeof(centerHex), "#%02X%02X%02X", zone[2].r, zone[2].g, zone[2].b);
 
-  // Current track name — strip leading slash and extension
-  char trackName[48] = "";
-  if (trackCount > 0) {
-    strlcpy(trackName, trackPath[curTrack] + 1, sizeof(trackName));
-    char* dot = strrchr(trackName, '.'); if (dot) *dot = 0;
+  // Preserve the full SD path so the web audio page can match its playlist item.
+  char trackName[96] = "";
+  if (audioStarted && curTrack >= 0 && curTrack < trackCount) {
+    strlcpy(trackName, trackPath[curTrack], sizeof(trackName));
   }
 
   // Escape lightMode string for JSON (replace " with \")
   char modeEsc[48];
   strlcpy(modeEsc, lightMode.c_str(), sizeof(modeEsc));
 
-  char json[560];
+  char json[640];
   snprintf(json, sizeof(json),
     "{"
     "\"gateOpen\":%s,"
@@ -3604,12 +3719,6 @@ void setupTouch() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// AUDIO TASK  (runs on core 0 so TFT redraws on core 1 never stutter)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-void audioTask(void*) { for (;;) { audio.loop(); vTaskDelay(1); } }
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // SETUP / LOOP
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -3636,25 +3745,10 @@ void setup() {
   setupTouch();
   tft.fillScreen(C_BG);
 
-  // Keep GPIO25-27 free for the rotary encoder until SD/I2S wiring is restored.
-  if (SD_AUDIO_ENABLED) {
-    sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-    sdOk = SD.begin(SD_CS, sdSPI, 16000000);
-    if (sdOk) {
-      scanTracks();
-      Serial.printf("[SD] %d track(s) found\n", trackCount);
-    } else {
-      Serial.println("[SD] Card not found");
-    }
-
-    audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-    audio.setVolume(volToAudio(volume));
-    xTaskCreatePinnedToCore(audioTask, "audio", 10000, NULL, 2, NULL, 0);
-  } else {
-    sdOk = false;
-    trackCount = 0;
-    Serial.println("[SD/AUDIO] Temporarily disabled; GPIO25-27 reserved for rotary encoder");
-  }
+  // Audio and SD playback run on the slave; this ESP32 only proxies controls/state.
+  sdOk = false;
+  trackCount = 0;
+  Serial.println("[AUDIO] SD card and playback are handled by slave ESP32");
 
   // ── Mic ──────────────────────────────────────────────────────────────────
   pinMode(MIC_PIN, INPUT);
@@ -3736,8 +3830,8 @@ void loop() {
   // Sensor / animation updates (lights only when gate is open)
   if (gateState == GS_OPEN) {  
     updateLive();
-    autoAdvance();
   }
+  syncSlaveAudioState();
   
   // Enrollment polling
   pollEnrollment();

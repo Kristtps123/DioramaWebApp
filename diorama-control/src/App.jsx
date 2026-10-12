@@ -142,15 +142,10 @@ function App() {
         set('drainagePumpOn',   s.drainagePumpOn);
         set('volume',           s.volume);
         set('audioPlaying',     s.audioPlaying);
+        set('audioTrack',       s.audioTrack || 'No audio selected');
         set('fountainColor',    s.fountainColor);
         set('fountainAuxColor', s.fountainAuxColor);
         set('circleColor',      s.circleColor);
-
-        // Audio track — only update if ESP32 has one and it's different
-        if (s.audioTrack && s.audioTrack !== '' && prev.audioTrack !== s.audioTrack) {
-          next.audioTrack = s.audioTrack;
-          changed = true;
-        }
 
         return changed ? next : prev;
       });

@@ -10,7 +10,7 @@ import {
   Unlock
 } from 'lucide-react';
 import DioramaCanvas from '../../components/DioramaCanvas';
-import { sendAudioPlay, sendAudioPause } from '../../services/esp32Api';
+import { getAudioFiles, sendAudioPlay, sendAudioPause } from '../../services/esp32Api';
 import './Home.css';
 
 export default function Home({ appState, setAppState, setActiveTab, showToast, onGateClose }) {
@@ -23,6 +23,10 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
   } = appState;
   const lightingModeLabel = lightingMode === 'Colorful' ? 'Custom Color' : lightingMode;
   const isAdaptiveBrightness = lightingMode === 'Color Adaptive';
+  const audioTitle = audioTrack
+    .replace(/^.*[\\/]/, '')
+    .replace(/\.[^/.]+$/, '')
+    .replace(/[_-]/g, ' ');
   const isSoundReactive = lightingMode === 'Sound Reactive';
 
   const [isScanning, setIsScanning] = useState(false);
@@ -184,7 +188,7 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
               </div>
               <div className="title-stack">
                 <h3 className="card-title">Audio</h3>
-                <span className="card-status-subtext">{audioTrack}</span>
+                <span className="card-status-subtext">{audioTitle}</span>
               </div>
             </div>
             <button
@@ -192,9 +196,15 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
               onClick={async () => {
                 const next = !audioPlaying;
                 if (next) {
-                  // Use last known track, or fall back to first track on the SD card
-                  const track = audioTrack !== 'No audio selected' ? audioTrack : '001.mp3';
-                  await sendAudioPlay(track);
+                  let track = audioTrack !== 'No audio selected' ? audioTrack : '';
+                  if (!track) {
+                    const files = await getAudioFiles();
+                    track = files[0] || '';
+                  }
+                  if (!track || !(await sendAudioPlay(track))) {
+                    showToast('No playable tracks found on the slave SD card');
+                    return;
+                  }
                   setAppState((prev) => ({
                     ...prev,
                     audioPlaying: true,
@@ -202,7 +212,10 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
                   }));
                   showToast(`Playing ${track}`);
                 } else {
-                  await sendAudioPause();
+                  if (!(await sendAudioPause())) {
+                    showToast('Could not reach the slave audio player');
+                    return;
+                  }
                   setAppState((prev) => ({ ...prev, audioPlaying: false }));
                   showToast('Audio Paused');
                 }

@@ -82,7 +82,7 @@
 #define PWM_FREQ_LED   5000  // 5 kHz for flicker-free LED dimming
 #define PWM_FREQ_MOTOR 1000  // 1 kHz for TB6612FNG motor control
 #define PWM_RESOLUTION 8     // 8-bit resolution (0 to 255)
-#define MAX_FOUNTAIN_PWM 215 // Keep pump PWM below the TB6612FNG test maximum
+#define MAX_FOUNTAIN_PWM 100 // Limit pump PWM to 100/255
 
 // ─── HARDWARE STATE ────────────────────────────────────────────────────────────
 struct RGBColor {

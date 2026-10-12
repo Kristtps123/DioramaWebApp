@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Music, Play, Pause, RefreshCw, AlertCircle } from 'lucide-react';
 import { getAudioFiles, sendAudioPlay, sendAudioPause } from '../../services/esp32Api';
 import './Audio.css';
@@ -18,8 +18,6 @@ export default function Audio({ appState, setAppState, showToast }) {
       .replace(/[_-]/g, ' ');    // underscores / dashes → spaces
 
   const fetchTracks = useCallback(async () => {
-    setLoading(true);
-    setError(false);
     const files = await getAudioFiles();
     if (files.length === 0) {
       setError(true);
@@ -29,18 +27,41 @@ export default function Audio({ appState, setAppState, showToast }) {
   }, []);
 
   useEffect(() => {
-    fetchTracks();
-  }, [fetchTracks]);
+    let isActive = true;
+    getAudioFiles().then((files) => {
+      if (!isActive) return;
+      setError(files.length === 0);
+      setTracks(files);
+      setLoading(false);
+    });
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  const refreshTracks = () => {
+    setLoading(true);
+    void fetchTracks();
+  };
 
   const handlePlayToggle = async (filename) => {
     if (audioTrack === filename && audioPlaying) {
       // Pause
-      await sendAudioPause();
+      const ok = await sendAudioPause();
+      if (!ok) {
+        showToast('Could not reach the slave audio player');
+        return;
+      }
       setAppState(prev => ({ ...prev, audioPlaying: false }));
       showToast('Audio paused');
     } else {
       // Play
-      await sendAudioPlay(filename);
+      const ok = await sendAudioPlay(filename);
+      if (!ok) {
+        showToast('Could not play this track. Check the slave ESP32 and /DIORAMA files.');
+        return;
+      }
       setAppState(prev => ({ ...prev, audioPlaying: true, audioTrack: filename }));
       showToast(`Playing ${formatName(filename)}`);
     }
@@ -61,7 +82,7 @@ export default function Audio({ appState, setAppState, showToast }) {
           <h2 className="section-block-title">SD Card Tracks</h2>
           <button
             className="btn-icon-refresh"
-            onClick={fetchTracks}
+            onClick={refreshTracks}
             title="Refresh track list"
           >
             <RefreshCw size={16} className={loading ? 'spin' : ''} />
