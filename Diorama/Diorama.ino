@@ -82,9 +82,9 @@ struct FingerprintUser {
 };
 
 // ── Libraries ────────────────────────────────────────────────────────────────
+#include <FS.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
-#include <FS.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
