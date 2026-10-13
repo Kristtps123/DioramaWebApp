@@ -139,6 +139,7 @@ function App() {
         set('fountainOn',       s.fountainOn);
         set('fountainStrength', s.fountainStr);
         set('fountainAuxStrength', s.fountainAux);
+        set('fountainForceSensorOn', s.fountainForceSensorOn);
         set('drainagePumpOn',   s.drainagePumpOn);
         set('volume',           s.volume);
         set('audioPlaying',     s.audioPlaying);

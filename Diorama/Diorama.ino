@@ -12,9 +12,10 @@
   Rotary      : CLK 25, DT 26, SW 27
   TB6612FNG   : PWMA + PWMB -> GPIO 13 (shared pump speed); AIN1/BIN1 -> 3V3,
                 AIN2/BIN2 -> GND, STBY -> 3V3. Use an external pump supply.
+  Force sensor: connected to slave ESP32 GPIO 36 (VP / ADC1).
   SD/audio    : SD card and PAM8403 are on the slave ESP32; main proxies audio controls.
   Mic         : GPIO 35  (ADC1 input-only analog)
-  RGB LEDs    : driven by the slave ESP32; main forwards RGB/mode commands
+  RGB LEDs    : driven by the slave ESP32; m  ain forwards RGB/mode commands
   Shared I2C bus: ESP32 SDA=32, SCL=33 -> VEML7700 and PCA9685 SDA/SCL
   Color controller UART1: Nano TX -> ESP32 GPIO 34 (D34), 9600 baud
                          Level converter: HV=5V(Nano), HV1=Nano TX, HV-GND=Nano GND
@@ -32,6 +33,8 @@
   GET /api/color?r=0-255&g=0-255&b=0-255&target=left|right|center|all
   GET /api/color/source?mode=scan|picker
   GET /api/fountain?state=on|off&strength=0-100&auxStrength=0-100
+  GET /api/force-sensor?state=on|off
+  GET /api/force                                → {"active":bool,"level":0-1023}
   GET /api/drainage-pump?state=on|off
   GET /api/gate?state=open|closed
   GET /api/gate/status                          → {"open":true|false}
@@ -233,6 +236,9 @@ constexpr int MAX_FOUNTAIN_PWM = 100;
 bool    fountainOn  = false;
 int     fountainStr = 100;  // 0-100
 int     fountainAux = 100;  // Mirrors shared speed for compatibility with the UI state.
+bool    forceSensorOn = false;
+int     manualFountainStr = 100;
+int     forceSensorLevel = 0; // Nonlinear sensor level normalized to 0-1023 for the web UI.
 bool    drainagePumpOn = false; // Software state only until a hardware pin is assigned.
 
 int fountainPumpDuty() {
@@ -3013,9 +3019,9 @@ void handleColorScan() {
 // ── GET /api/fountain?state=on|off&strength=0-100&auxStrength=0-100 ──────────
 void handleFountain() {
   if (server.hasArg("state"))       fountainOn  = (server.arg("state") == "on");
-  if (server.hasArg("strength")) {
+  if (!forceSensorOn && server.hasArg("strength")) {
     fountainStr = constrain(server.arg("strength").toInt(), 0, 100);
-  } else if (server.hasArg("auxStrength")) {
+  } else if (!forceSensorOn && server.hasArg("auxStrength")) {
     fountainStr = constrain(server.arg("auxStrength").toInt(), 0, 100);
   }
   fountainAux = fountainStr;
@@ -3024,6 +3030,114 @@ void handleFountain() {
   Serial.printf("[PUMPS] state=%s sharedSpeed=%d%% pwm=%d/255\n",
                 fountainOn ? "on" : "off", fountainStr, fountainPumpDuty());
   jsonOk();
+}
+
+bool readSlaveForceSensorLevel(int& level) {
+  WiFiClient client;
+  client.setTimeout(100);
+  if (!client.connect(IPAddress(192, 168, 4, 200), 80, 100)) return false;
+
+  client.print("GET /force HTTP/1.0\r\nHost: 192.168.4.200\r\nConnection: close\r\n\r\n");
+  const uint32_t startedAt = millis();
+  while (!client.available() && client.connected() && millis() - startedAt < 250) {
+    delay(1);
+  }
+  if (!client.available()) {
+    client.stop();
+    return false;
+  }
+
+  const String statusLine = client.readStringUntil('\n');
+  if (statusLine.indexOf(" 200 ") < 0) {
+    client.stop();
+    return false;
+  }
+  while (client.connected() || client.available()) {
+    if (!client.available()) {
+      if (millis() - startedAt >= 300) {
+        client.stop();
+        return false;
+      }
+      delay(1);
+      continue;
+    }
+    const String header = client.readStringUntil('\n');
+    if (header == "\r" || header.length() == 0) break;
+  }
+
+  String body;
+  while (client.connected() || client.available()) {
+    while (client.available()) body += static_cast<char>(client.read());
+    if (millis() - startedAt >= 300) break;
+    delay(1);
+  }
+  client.stop();
+  StaticJsonDocument<64> response;
+  const DeserializationError error = deserializeJson(response, body);
+  if (error || !response["level"].is<int>()) return false;
+
+  level = constrain(response["level"].as<int>(), 0, 1023);
+  return true;
+}
+
+// ── GET /api/force-sensor?state=on|off ───────────────────────────────────────
+void handleForceSensorControl() {
+  if (!server.hasArg("state") ||
+      (server.arg("state") != "on" && server.arg("state") != "off")) {
+    server.send(400, "application/json",
+                "{\"error\":\"missing or invalid state; use state=on or state=off\"}");
+    return;
+  }
+
+  const bool requestedState = server.arg("state") == "on";
+  if (requestedState && !fountainOn) {
+    server.send(409, "application/json",
+                "{\"error\":\"turn the fountain on before enabling force sensor control\"}");
+    return;
+  }
+
+  if (requestedState != forceSensorOn) {
+    if (requestedState) {
+      manualFountainStr = fountainStr;
+      forceSensorOn = true;
+    } else {
+      forceSensorOn = false;
+      forceSensorLevel = 0;
+      fountainStr = manualFountainStr;
+      fountainAux = fountainStr;
+      applyFountainPumpOutput();
+    }
+  }
+
+  Serial.printf("[FORCE SENSOR] state=%s strength=%d%%\n",
+                forceSensorOn ? "on" : "off", fountainStr);
+  jsonOk();
+}
+
+// ── GET /api/force → {"active":bool,"level":0-1023} ──────────────────────────
+void handleForceSensorLevel() {
+  if (forceSensorOn) {
+    int level;
+    if (!readSlaveForceSensorLevel(level)) {
+      static uint32_t lastReadErrorMs = 0;
+      if (millis() - lastReadErrorMs >= 5000) {
+        Serial.println("[FORCE SENSOR] ERROR: could not read sensor from slave ESP32");
+        lastReadErrorMs = millis();
+      }
+      server.send(503, "application/json",
+                  "{\"error\":\"force sensor unavailable on slave ESP32\"}");
+      return;
+    }
+    forceSensorLevel = level;
+    fountainStr = (level * 100 + 511) / 1023;
+    fountainAux = fountainStr;
+    applyFountainPumpOutput();
+  }
+
+  char response[64];
+  snprintf(response, sizeof(response), "{\"active\":%s,\"level\":%d}",
+           forceSensorOn ? "true" : "false", forceSensorLevel);
+  server.send(200, "application/json", response);
 }
 
 // ── GET /api/drainage-pump?state=on|off ──────────────────────────────────────
@@ -3240,6 +3354,7 @@ void handleState() {
     "\"fountainOn\":%s,"
     "\"fountainStr\":%d,"
     "\"fountainAux\":%d,"
+    "\"fountainForceSensorOn\":%s,"
     "\"drainagePumpOn\":%s,"
     "\"volume\":%d,"
     "\"audioPlaying\":%s,"
@@ -3258,6 +3373,7 @@ void handleState() {
     fountainOn     ? "true" : "false",
     fountainStr,
     fountainAux,
+    forceSensorOn  ? "true" : "false",
     drainagePumpOn ? "true" : "false",
     volume,
     audioPlaying   ? "true" : "false",
@@ -3459,6 +3575,8 @@ void setupRoutes() {
   server.on("/api/color/source",     HTTP_OPTIONS, handleOptions);
   server.on("/api/color/scan",       HTTP_OPTIONS, handleOptions);
   server.on("/api/fountain",         HTTP_OPTIONS, handleOptions);
+  server.on("/api/force-sensor",     HTTP_OPTIONS, handleOptions);
+  server.on("/api/force",            HTTP_OPTIONS, handleOptions);
   server.on("/api/drainage-pump",   HTTP_OPTIONS, handleOptions);
   server.on("/api/gate",             HTTP_OPTIONS, handleOptions);
   server.on("/api/gate/status",      HTTP_OPTIONS, handleOptions);
@@ -3483,6 +3601,8 @@ void setupRoutes() {
   server.on("/api/color/source", HTTP_GET, []() { addCORSHeaders(); handleColorSource(); });
   server.on("/api/color/scan", HTTP_GET, []() { addCORSHeaders(); handleColorScan();    });
   server.on("/api/fountain",HTTP_GET,[]() { addCORSHeaders(); handleFountain();     });
+  server.on("/api/force-sensor", HTTP_GET, []() { addCORSHeaders(); handleForceSensorControl(); });
+  server.on("/api/force", HTTP_GET, []() { addCORSHeaders(); handleForceSensorLevel(); });
   server.on("/api/drainage-pump",HTTP_GET,[]() { addCORSHeaders(); handleDrainagePump(); });
   server.on("/api/gate",   HTTP_GET, []() { addCORSHeaders(); handleGate();         });
   server.on("/api/gate/status", HTTP_GET, []() { addCORSHeaders(); handleGateStatus(); });
