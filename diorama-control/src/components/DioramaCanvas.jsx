@@ -121,7 +121,6 @@ export default function DioramaCanvas({
       return;
     }
     let cancelled = false;
-    let simPhase = 0;
     const poll = async () => {
       if (cancelled) return;
       const data = await getForceLevel();
@@ -133,13 +132,10 @@ export default function DioramaCanvas({
             strength: Math.min(100, Math.round(data.level / 10.23))
           };
         } else {
-          // If offline / simulated fallback: smooth natural breathing force
-          simPhase += 0.08;
-          const simStrength = Math.round(55 + Math.sin(simPhase) * 35);
           forceDataRef.current = {
-            active: true,
-            level: Math.round(simStrength * 10.23),
-            strength: simStrength
+            active: false,
+            level: 0,
+            strength: 0
           };
         }
       }

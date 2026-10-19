@@ -1,10 +1,31 @@
-import React from 'react';
-import { Waves, Droplet } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Droplet } from 'lucide-react';
 import DioramaCanvas from '../../components/DioramaCanvas';
+import { getForceLevel } from '../../services/esp32Api';
 import './Fountain.css';
 
 export default function Fountain({ appState, setAppState, showToast }) {
   const { fountainOn, fountainStrength, fountainAuxStrength, fountainForceSensorOn, fountainPattern, fountainColor } = appState;
+  const [forceReading, setForceReading] = useState(null);
+
+  useEffect(() => {
+    if (!fountainForceSensorOn) return undefined;
+
+    let cancelled = false;
+    let timer;
+    const readSensor = async () => {
+      const reading = await getForceLevel();
+      if (cancelled) return;
+      setForceReading(reading?.active ? reading : null);
+      timer = setTimeout(readSensor, 500);
+    };
+    void readSensor();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [fountainForceSensorOn]);
 
   return (
     <div className="page-container">
@@ -92,6 +113,7 @@ export default function Fountain({ appState, setAppState, showToast }) {
               disabled={!fountainOn}
               onChange={(e) => {
                 const on = e.target.checked;
+                setForceReading(null);
                 setAppState((prev) => ({ ...prev, fountainForceSensorOn: on }));
                 showToast(on ? '⚡ Force Sensor ON: Pressure controls fountain strength' : 'Force Sensor OFF: Sliders restored');
               }}
@@ -105,15 +127,23 @@ export default function Fountain({ appState, setAppState, showToast }) {
           <div className="force-sensor-status-box mt-3">
             <div className="force-status-header">
               <span className="force-status-tag">
-                <span className="scanning-dot green"></span> SENSOR ACTIVE
+                <span className={`scanning-dot ${forceReading ? 'green' : 'teal'}`}></span>
+                {forceReading ? 'SENSOR ACTIVE' : 'NO SENSOR DATA'}
               </span>
-              <span className="force-val-label">Auto Flow Control</span>
+              <span className="force-val-label">
+                {forceReading ? `Pressure ${forceReading.level}/1023` : 'Check sensor wiring'}
+              </span>
             </div>
             <p className="force-status-desc">
-              Physical force sensor is active. Pressing the FSR sensor dynamically controls fountain spray height.
+              {forceReading
+                ? 'Live sensor reading; press the FSR and check that the value changes.'
+                : 'The ESP32 is not returning an active force-sensor reading.'}
             </p>
             <div className="force-meter-bar-wrap">
-              <div className="force-meter-bar-fill"></div>
+              <div
+                className="force-meter-bar-fill"
+                style={{ width: `${forceReading ? (forceReading.level / 1023) * 100 : 0}%` }}
+              ></div>
             </div>
           </div>
         )}

@@ -25,12 +25,14 @@
   Fountain pumps: TB6612FNG PWMA/PWMB <- GPIO 13 (shared PWM speed);
                   AIN1/BIN1 -> 3.3V, AIN2/BIN2 -> GND, STBY -> 3.3V
   Fingerprint : RX2=16 ← sensor TX,  TX2=17 → sensor RX  (UART2)
-  Gate actuator: not configured (GPIO 15 is the TFT chip-select pin)
+  Gate servo   : signal GPIO 22; power from a suitable external supply,
+                 with the servo ground connected to ESP32 GND
 
   ── HTTP API (same endpoints as Web App) ────────────────────────────────────
   GET /api/light?state=on|off&brightness=0-100
   GET /api/mode?mode=Basic|Colorful|Custom+Color|Sound+Reactive|Color+Adaptive
   GET /api/color?r=0-255&g=0-255&b=0-255&target=left|right|center|all
+                                               (all RGB zones share one color)
   GET /api/color/source?mode=scan|picker
   GET /api/fountain?state=on|off&strength=0-100&auxStrength=0-100
   GET /api/force-sensor?state=on|off
@@ -41,7 +43,6 @@
   GET /api/audio/play?file=/DIORAMA/xxx.mp3
   GET /api/audio/pause
   GET /api/audio/stop
-  GET /api/audio/volume?volume=0-100
   GET /api/audio/files                          → {"files":["/DIORAMA/001.mp3",...]}
   Note: Audio endpoints proxy to the slave ESP32 and return an error if it is unavailable.
   GET /api/sound-reactive?state=on|off&intensity=0-100
@@ -52,7 +53,7 @@
 struct RGB    { uint8_t r, g, b; };   // must be first — used in function signatures
 enum Page     { P_LIGHTS = 0, P_AUDIO = 1, P_SETTINGS = 2 };
 enum Mode     { M_BASIC = 0, M_COLOR = 1, M_SOUND = 2, M_ADAPT = 3 };
-enum Drag     { D_NONE = 0, D_BR, D_HUE, D_SAT, D_SENS, D_VOL };
+enum Drag     { D_NONE = 0, D_BR, D_HUE, D_SAT, D_SENS };
 enum GateState { GS_WAITING = 0, GS_SCANNING = 1, GS_WELCOME = 2, GS_OPEN = 3, GS_GOODBYE = 4 };
 enum EncoderMode { ENC_NAVIGATE, ENC_FOCUS, ENC_ADJUST };
 enum EncoderControl {
@@ -64,7 +65,6 @@ enum EncoderControl {
   ENC_CONTROL_HUE,
   ENC_CONTROL_SATURATION,
   ENC_CONTROL_SENSITIVITY,
-  ENC_CONTROL_VOLUME,
   ENC_CONTROL_AUDIO_PREVIOUS,
   ENC_CONTROL_AUDIO_PLAY,
   ENC_CONTROL_AUDIO_NEXT,
@@ -91,6 +91,7 @@ struct FingerprintUser {
 #include <SPIFFS.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <driver/gpio.h>
@@ -123,6 +124,13 @@ struct FingerprintUser {
 #define COLOR_SENSOR_TIMEOUT_MS 5000
 #define COLOR_SENSOR_INVERTED_PWM false // Nano sends direct color values (255=Bright, 0=Dark)
 constexpr uint8_t PUMP_PWM_PIN = 13;
+constexpr uint8_t GATE_SERVO_PIN = 22;
+constexpr uint8_t GATE_SERVO_CHANNEL = 15;
+constexpr uint32_t GATE_SERVO_FREQUENCY = 50;
+constexpr uint8_t GATE_SERVO_RESOLUTION = 16;
+constexpr uint16_t GATE_SERVO_MIN_PULSE_US = 1000;
+constexpr uint16_t GATE_SERVO_MAX_PULSE_US = 2000;
+constexpr uint16_t GATE_SERVO_PERIOD_US = 20000;
 
 // Fingerprint sensor pins (UART2)
 #define FP_RX_PIN    16
@@ -253,6 +261,7 @@ void applyFountainPumpOutput() {
 bool    gateOpen    = false;
 GateState gateState = GS_WAITING;
 uint32_t  gateMs    = 0;
+bool      gateServoPwmReady = false;
 char      matchedUserName[32] = "";
 const uint32_t SCAN_MS    = 2000;
 const uint32_t WELCOME_MS = 3000;
@@ -262,7 +271,6 @@ const uint32_t GOODBYE_MS = 3000;
 #define MAX_TRACKS 24
 char     trackPath[MAX_TRACKS][96];
 int      trackCount = 0, curTrack = 0;
-int      volume     = 60;   // 0-100
 bool     sdOk = false, audioPlaying = false, audioStarted = false;
 uint32_t trackStartMs = 0;
 bool     slaveAudioReachable = false;
@@ -337,18 +345,16 @@ void IRAM_ATTR encoderQuadratureISR();
 void startEnrollment();
 bool deleteUser(int fpID);
 void togglePlay();
-void stepTrack(int direction);
+bool stepTrack(int direction);
 bool sendSlaveAudioCommand(const String& endpoint);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SLAVE ESP32 COMMUNICATION
 // ═══════════════════════════════════════════════════════════════════════════════
-// The slave ESP32 (192.168.4.200) drives 3 RGB LED groups via MOSFET PWM.
+// The slave ESP32 (192.168.4.200) drives 3 physically shared RGB groups via MOSFET PWM.
 // Master sends fire-and-forget HTTP GET requests — no blocking wait.
 //
-//   Group 1 = Left  Fountain  (zone[0])
-//   Group 2 = Right Fountain  (zone[1])
-//   Group 3 = Inner Circle    (zone[2])
+//   All three physical groups share one RGB value.
 //
 // Every /rgb (and /off) includes &mode=Basic|Colorful|Sound|Adaptive so the
 // slave knows which light mode owns the output:
@@ -413,7 +419,7 @@ void sendSlaveRGB(uint8_t group, RGB col, int br) {
 
   WiFiClient client;
   client.setTimeout(50);
-  if (!client.connect(SLAVE_IP, 80)) {
+  if (!client.connect(IPAddress(192, 168, 4, 200), 80, 200)) {
     // Slave down or rebooting — pause slave traffic so SoftAP stays free for the phone
     slaveBackoffUntilMs = now + 4000;
     Serial.println("[SLAVE] Unreachable — backing off 4s (web app stays available)");
@@ -443,7 +449,7 @@ void syncSlaveIfConnected() {
   // Only gentle resync for steady modes; Sound Reactive already pushes live
   const bool steadyMode = (lightMode == "Basic" || lightMode == "Colorful" || lightMode == "Color Adaptive");
   if (!steadyMode) return;
-  if (now - lastSyncMs < 8000) return;
+  if (now - lastSyncMs < 2000) return;
 
   lastSyncMs = now;
   pushZones();
@@ -459,6 +465,7 @@ void pushZones() {
   if (lightMode == "Basic") {
     zone[0] = zone[1] = zone[2] = {255, 255, 255};
   }
+  zone[1] = zone[2] = zone[0];
   for (int i = 0; i < 3; i++) {
     zone[i].r = constrain(zone[i].r, 0, 255);
     zone[i].g = constrain(zone[i].g, 0, 255);
@@ -471,16 +478,7 @@ void pushZones() {
   if (lightMode == "Sound Reactive" && (nowSlave - lastSlavePushMs) < 120) return;
   lastSlavePushMs = nowSlave;
 
-  bool allSame = (zone[0].r == zone[1].r && zone[0].g == zone[1].g && zone[0].b == zone[1].b &&
-                  zone[1].r == zone[2].r && zone[1].g == zone[2].g && zone[1].b == zone[2].b);
-
-  if (allSame) {
-    sendSlaveRGB(0, zone[0], brightness);  // group=0 → sends "all"
-  } else {
-    sendSlaveRGB(1, zone[0], brightness);  // Group 1 = left fountain
-    sendSlaveRGB(2, zone[1], brightness);  // Group 2 = right fountain
-    sendSlaveRGB(3, zone[2], brightness);  // Group 3 = inner circle
-  }
+  sendSlaveRGB(0, zone[0], brightness);  // group=0 → sends "all"
 }
 
 void setAll(RGB c) {
@@ -489,9 +487,51 @@ void setAll(RGB c) {
 }
 
 void applyHardwareGate(bool open) {
-  // Replace with servo / relay:
-  // myServo.write(open ? 90 : 0);
-  Serial.printf("[GATE] Actuator: %s\n", open ? "OPEN" : "CLOSED");
+  if (!gateServoPwmReady) {
+    Serial.println("[GATE] ERROR: servo PWM is not initialized");
+    return;
+  }
+
+  const uint8_t angle = open ? 180 : 0;
+  const uint32_t pulseUs = GATE_SERVO_MIN_PULSE_US +
+      (static_cast<uint32_t>(GATE_SERVO_MAX_PULSE_US - GATE_SERVO_MIN_PULSE_US) *
+       angle) / 180;
+  const uint32_t maxDuty = (1UL << GATE_SERVO_RESOLUTION) - 1;
+  const uint32_t duty = pulseUs * maxDuty / GATE_SERVO_PERIOD_US;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  if (!ledcWrite(GATE_SERVO_PIN, duty)) {
+    Serial.println("[GATE] ERROR: failed to write servo PWM");
+    return;
+  }
+#else
+  ledcWrite(GATE_SERVO_CHANNEL, duty);
+#endif
+  Serial.printf("[GATE] Servo: %s (%u degrees)\n",
+                open ? "OPEN" : "CLOSED", angle);
+}
+
+bool setupGateServo() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  gateServoPwmReady = ledcAttach(
+      GATE_SERVO_PIN, GATE_SERVO_FREQUENCY, GATE_SERVO_RESOLUTION);
+#else
+  gateServoPwmReady = ledcSetup(
+      GATE_SERVO_CHANNEL, GATE_SERVO_FREQUENCY, GATE_SERVO_RESOLUTION) > 0;
+  if (gateServoPwmReady) {
+    ledcAttachPin(GATE_SERVO_PIN, GATE_SERVO_CHANNEL);
+  }
+#endif
+
+  if (!gateServoPwmReady) {
+    Serial.printf("[GATE] ERROR: unable to initialize servo PWM on GPIO %u\n",
+                  GATE_SERVO_PIN);
+    return false;
+  }
+
+  applyHardwareGate(false);
+  Serial.printf("[GATE] Servo PWM ready on GPIO %u at %lu Hz\n",
+                GATE_SERVO_PIN, static_cast<unsigned long>(GATE_SERVO_FREQUENCY));
+  return true;
 }
 
 int parseColorSensorPacket(const char* packet, RGB* color) {
@@ -986,7 +1026,9 @@ void drawHeader() {
   txt("Settings", 442, HDR_H / 2, 2, aS ? C_WHITE : C_DIM, aS ? C_PURPLE : C_HDR, MC_DATUM);
 
   // WiFi AP dot (green = AP active) + SD dot
-  tft.fillCircle(474, 8,  4, WiFi.softAPgetStationNum() >= 0 ? C_GREEN : C_RED);
+  const wifi_mode_t wifiMode = WiFi.getMode();
+  const bool accessPointActive = wifiMode == WIFI_AP || wifiMode == WIFI_AP_STA;
+  tft.fillCircle(474, 8,  4, accessPointActive ? C_GREEN : C_RED);
   tft.fillCircle(474, 22, 4, sdOk ? C_GREEN : C_RED);
 }
 
@@ -1329,6 +1371,17 @@ void drawGateScreen() {
 }
 
 void enterGateState(GateState s) {
+  const bool closingOpenGate =
+      gateOpen && (s == GS_GOODBYE || s == GS_WAITING);
+  if (closingOpenGate) {
+    Serial.println("[GATE] Closing gate; stopping slave audio");
+    if (!sendSlaveAudioCommand("/audio/stop")) {
+      Serial.println("[GATE] WARNING: could not confirm audio stop on slave");
+    }
+    audioPlaying = false;
+    audioStarted = false;
+  }
+
   gateState = s;
   gateMs    = millis();
 
@@ -1611,9 +1664,6 @@ void drawLights() {
 //  y  40..76  : Track title + counter
 //  y  80..96  : Playback status
 //  y 102..170 : Transport buttons  [  <<  ]  [ Play/Pause ]  [  >>  ]
-//  y 178..198 : "Volume" label + value
-//  y 202..240 : Volume slider
-//
 // ─────────────────────────────────────────────────────────────────────────────
 
 void drawAudio() {
@@ -1666,13 +1716,6 @@ void drawAudio() {
   drawEncoderFocusCue(340, BODY_Y + 92, 110, 58,
                       encoderControl == ENC_CONTROL_AUDIO_NEXT);
 
-  // Volume
-  label("Volume", SL_X0, BODY_Y + 162);
-  drawPct(W - 10, BODY_Y + 166, volume, C_GREEN);
-  drawSlider(BODY_Y + 200, volume, C_GREEN);
-  drawFocusCue(SL_X0, BODY_Y + 182, SL_X1 - SL_X0, 36, 4, false);
-  drawEncoderFocusCue(SL_X0, BODY_Y + 182, SL_X1 - SL_X0, 36,
-                      encoderControl == ENC_CONTROL_VOLUME);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1789,7 +1832,6 @@ int getEncoderControls(EncoderControl* controls) {
     controls[count++] = ENC_CONTROL_AUDIO_PREVIOUS;
     controls[count++] = ENC_CONTROL_AUDIO_PLAY;
     controls[count++] = ENC_CONTROL_AUDIO_NEXT;
-    controls[count++] = ENC_CONTROL_VOLUME;
   } else {
     controls[count++] = ENC_CONTROL_SETTINGS_ENROLL;
     for (int i = 0; i < min(userCount, 6); i++) {
@@ -1829,7 +1871,6 @@ bool encoderControlCanAdjust() {
     case ENC_CONTROL_HUE:
     case ENC_CONTROL_SATURATION:
     case ENC_CONTROL_SENSITIVITY:
-    case ENC_CONTROL_VOLUME:
       return true;
     default:
       return false;
@@ -1897,7 +1938,7 @@ void changePage(Page nextPage, int direction) {
   page = nextPage;
   encoderMode = ENC_NAVIGATE;
   if (page == P_LIGHTS) encoderControl = ENC_CONTROL_BRIGHTNESS;
-  else if (page == P_AUDIO) encoderControl = ENC_CONTROL_VOLUME;
+  else if (page == P_AUDIO) encoderControl = ENC_CONTROL_AUDIO_PLAY;
   else encoderControl = ENC_CONTROL_SETTINGS_ENROLL;
   syncEncoderControlIndex();
   redrawCurrentPage();
@@ -2021,12 +2062,6 @@ void applyEncoderStep(int direction) {
       drawModePanel();
       break;
     }
-
-    case ENC_CONTROL_VOLUME:
-      volume = constrain(volume + direction * 5, 0, 100);
-      sendSlaveAudioCommand("/audio/volume?volume=" + String(volume));
-      if (page == P_AUDIO) drawAudio();
-      break;
 
     default:
       break;
@@ -2335,40 +2370,29 @@ void updateLive() {
 
 bool requestSlaveAudio(const String& endpoint, String& body, int& statusCode) {
   WiFiClient client;
-  client.setTimeout(300);
-  if (!client.connect(IPAddress(192, 168, 4, 200), 80, 500)) return false;
+  HTTPClient http;
+  const String url = "http://192.168.4.200" + endpoint;
 
-  client.print("GET ");
-  client.print(endpoint);
-  client.print(" HTTP/1.0\r\nHost: 192.168.4.200\r\nConnection: close\r\n\r\n");
+  if (!http.begin(client, url)) {
+    Serial.printf("[AUDIO] Could not initialize request: %s\n", url.c_str());
+    return false;
+  }
+  http.setConnectTimeout(300);
+  http.setTimeout(800);
+  http.addHeader("Connection", "close");
 
-  const uint32_t startedAt = millis();
-  while (!client.available() && client.connected() && millis() - startedAt < 700) delay(1);
-  if (!client.available()) {
-    client.stop();
+  const int responseCode = http.GET();
+  if (responseCode <= 0) {
+    Serial.printf("[AUDIO] Request failed: %s (%s)\n",
+                  url.c_str(), http.errorToString(responseCode).c_str());
+    http.end();
+    statusCode = 0;
     return false;
   }
 
-  const String statusLine = client.readStringUntil('\n');
-  statusCode = statusLine.length() >= 12 ? statusLine.substring(9, 12).toInt() : 0;
-  while (client.connected() || client.available()) {
-    if (!client.available()) {
-      if (millis() - startedAt >= 1200) break;
-      delay(1);
-      continue;
-    }
-    String header = client.readStringUntil('\n');
-    if (header == "\r" || header.length() == 0) break;
-  }
-
-  body = "";
-  const uint32_t bodyStartedAt = millis();
-  while (client.connected() || client.available()) {
-    while (client.available()) body += static_cast<char>(client.read());
-    if (millis() - bodyStartedAt >= 1200) break;
-    delay(1);
-  }
-  client.stop();
+  statusCode = responseCode;
+  body = http.getString();
+  http.end();
   return statusCode >= 200 && statusCode < 300;
 }
 
@@ -2396,20 +2420,15 @@ bool sendSlaveAudioCommand(const String& endpoint) {
   return ok;
 }
 
-void refreshSlaveAudioTracks() {
-  lastSlaveAudioListMs = millis();
-  String response;
-  int statusCode = 0;
-  if (!requestSlaveAudio("/audio/files", response, statusCode)) {
-    slaveAudioReachable = false;
-    sdOk = false;
-    return;
-  }
-
+bool parseSlaveAudioTracks(const String& response) {
   StaticJsonDocument<4096> doc;
   if (deserializeJson(doc, response)) {
     Serial.println("[AUDIO] ERROR: invalid track-list response from slave");
-    return;
+    return false;
+  }
+  if (!doc["files"].is<JsonArrayConst>()) {
+    Serial.println("[AUDIO] ERROR: slave track-list response has no files array");
+    return false;
   }
 
   slaveAudioReachable = true;
@@ -2422,11 +2441,25 @@ void refreshSlaveAudioTracks() {
     if (path && *path) strlcpy(trackPath[trackCount++], path, sizeof(trackPath[0]));
   }
   lastSlaveAudioListMs = millis();
+  return true;
+}
+
+void refreshSlaveAudioTracks() {
+  lastSlaveAudioListMs = millis();
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/audio/files", response, statusCode)) {
+    slaveAudioReachable = false;
+    sdOk = false;
+    Serial.printf("[AUDIO] Track-list request to slave failed (HTTP %d)\n", statusCode);
+    return;
+  }
+  parseSlaveAudioTracks(response);
 }
 
 void syncSlaveAudioState() {
   const uint32_t now = millis();
-  if (now - lastSlaveAudioSyncMs < 1200) return;
+  if (now - lastSlaveAudioSyncMs < 3000) return;
   lastSlaveAudioSyncMs = now;
 
   if (!slaveAudioReachable && now - lastSlaveAudioListMs < 5000) return;
@@ -2452,7 +2485,6 @@ void syncSlaveAudioState() {
   const bool wasReady = sdOk;
   const bool wasPlaying = audioPlaying;
   const int oldTrack = curTrack;
-  const uint8_t oldVolume = volume;
   char previousTrack[sizeof(trackPath[0])];
   previousTrack[0] = '\0';
   if (audioStarted && curTrack >= 0 && curTrack < trackCount) {
@@ -2462,7 +2494,6 @@ void syncSlaveAudioState() {
   slaveAudioReachable = true;
   sdOk = doc["sdCardReady"] | false;
   audioPlaying = doc["playing"] | false;
-  volume = constrain(doc["volume"] | volume, 0, 100);
   const char* currentPath = doc["track"] | "";
   audioStarted = currentPath[0] != '\0';
   if (audioStarted) {
@@ -2479,20 +2510,38 @@ void syncSlaveAudioState() {
     : previousTrack[0] != '\0';
   if (page == P_AUDIO &&
       (wasReady != sdOk || wasPlaying != audioPlaying ||
-       oldTrack != curTrack || oldVolume != volume || trackChanged)) {
+       oldTrack != curTrack || trackChanged)) {
     drawAudio();
   }
 }
 
-void startTrack(int i) {
-  if (i < 0 || i >= trackCount) return;
+bool startTrack(int i) {
+  if (i < 0 || i >= trackCount) return false;
   const String endpoint = "/audio/play?file=" + encodeAudioPath(trackPath[i]);
   if (sendSlaveAudioCommand(endpoint)) {
     curTrack = i;
     audioPlaying = audioStarted = true;
     trackStartMs = millis();
     Serial.printf("[AUDIO] Playing %d/%d: %s\n", curTrack + 1, trackCount, trackPath[i]);
+    return true;
   }
+  return false;
+}
+
+bool stepTrack(int direction) {
+  if (!trackCount) return false;
+  const int next = audioStarted
+    ? (curTrack + direction + trackCount) % trackCount
+    : (direction > 0 ? 0 : trackCount - 1);
+  const char* endpoint = direction > 0 ? "/audio/next" : "/audio/previous";
+  if (!sendSlaveAudioCommand(endpoint)) return false;
+
+  curTrack = next;
+  audioPlaying = audioStarted = true;
+  trackStartMs = millis();
+  Serial.printf("[AUDIO] Stepped to %d/%d: %s\n",
+                curTrack + 1, trackCount, trackPath[curTrack]);
+  return true;
 }
 
 void togglePlay() {
@@ -2503,13 +2552,6 @@ void togglePlay() {
     const int selected = audioStarted ? curTrack : 0;
     startTrack(selected);
   }
-}
-
-void stepTrack(int direction) {
-  if (!trackCount) return;
-  const int next = (curTrack + direction + trackCount) % trackCount;
-  curTrack = next;
-  if (audioStarted) startTrack(next);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2641,12 +2683,6 @@ void onPress(int x, int y) {
       selectEncoderControl(ENC_CONTROL_AUDIO_NEXT);
       stepTrack(1); drawAudio(); return;
     }
-    // Volume slider zone
-    if (inRect(x, y, SL_X0, BODY_Y + 182, SL_X1 - SL_X0, 40)) {
-      selectEncoderControl(ENC_CONTROL_VOLUME);
-      drawAudio();
-      dragging = D_VOL; onDrag(x);
-    }
     return;
   }
 
@@ -2777,18 +2813,6 @@ void onDrag(int x) {
         sens = p;
         Serial.printf("[SOUND] Sensitivity %d%%\n", sens);
         drawModePanel();
-      }
-      break;
-
-    case D_VOL:
-      if (p != volume) {
-        volume = p;
-        Serial.printf("[AUDIO] Volume %d%%\n", volume);
-        drawPct(W - 10, BODY_Y + 166, p, C_GREEN);
-        drawSlider(BODY_Y + 200, p, C_GREEN);
-        drawEncoderFocusCue(SL_X0, BODY_Y + 182, SL_X1 - SL_X0, 36,
-                            encoderControl == ENC_CONTROL_VOLUME);
-        sendSlaveAudioCommand("/audio/volume?volume=" + String(p));
       }
       break;
 
@@ -2969,14 +2993,9 @@ void handleColor() {
   Serial.printf("[HTTP /api/color] r=%d g=%d b=%d target=%s\n", r, g, b, target.c_str());
 
   RGB col = {r, g, b};
-  if      (target == "left")   zone[0] = col;
-  else if (target == "right")  zone[1] = col;
-  else if (target == "center") zone[2] = col;
-  else {
-    cur = col;
-    rgbToHsvValues(cur.r, cur.g, cur.b, &hue, &sat);
-    zone[0] = zone[1] = zone[2] = col;
-  }
+  cur = col;
+  rgbToHsvValues(cur.r, cur.g, cur.b, &hue, &sat);
+  zone[0] = zone[1] = zone[2] = col;
 
   pushZones();
   if (page == P_LIGHTS && tftMode == M_COLOR) drawColorPanel();
@@ -3183,8 +3202,13 @@ void handleGateStatus() {
 
 // ── GET /api/audio/play?file=xxx.mp3 ─────────────────────────────────────────
 void handleAudioPlay() {
-  if (!server.hasArg("file")) { server.send(400, "application/json", "{\"error\":\"missing file\"}"); return; }
+  if (!server.hasArg("file")) {
+    Serial.println("[AUDIO] Play request missing file parameter");
+    server.send(400, "application/json", "{\"error\":\"missing file\"}");
+    return;
+  }
   const String requested = server.arg("file");
+  Serial.printf("[AUDIO] Web play request: %s\n", requested.c_str());
   int index = -1;
   for (int i = 0; i < trackCount; ++i) {
     const char* name = strrchr(trackPath[i], '/');
@@ -3194,6 +3218,7 @@ void handleAudioPlay() {
     }
   }
   if (index < 0) {
+    Serial.println("[AUDIO] Play request rejected: track not in cached slave playlist");
     server.send(404, "application/json", "{\"error\":\"track not found in slave /DIORAMA playlist\"}");
     return;
   }
@@ -3202,10 +3227,14 @@ void handleAudioPlay() {
   String response;
   int statusCode = 0;
   if (!requestSlaveAudio(endpoint, response, statusCode)) {
+    Serial.printf("[AUDIO] Slave rejected/failed play request (HTTP %d): %s\n",
+                  statusCode, response.c_str());
     server.send(statusCode ? statusCode : 503, "application/json",
                 response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
     return;
   }
+  Serial.printf("[AUDIO] Slave accepted play request for track %d/%d: %s\n",
+                index + 1, trackCount, trackPath[index]);
   curTrack = index;
   audioPlaying = audioStarted = true;
   trackStartMs = millis();
@@ -3228,6 +3257,23 @@ void handleAudioPause() {
   server.send(statusCode, "application/json", response);
 }
 
+void handleAudioStep(int direction) {
+  Serial.printf("[HTTP /api/audio/%s]\n", direction > 0 ? "next" : "previous");
+  if (!slaveAudioReachable || !sdOk) refreshSlaveAudioTracks();
+  if (!sdOk || !trackCount) {
+    server.send(503, "application/json",
+                "{\"error\":\"slave SD/audio playlist unavailable\"}");
+    return;
+  }
+  if (!stepTrack(direction)) {
+    server.send(503, "application/json",
+                "{\"error\":\"slave rejected audio track change\"}");
+    return;
+  }
+  if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
+  server.send(200, "application/json", "{\"ok\":true}");
+}
+
 // ── GET /api/audio/stop ──────────────────────────────────────────────────────
 void handleAudioStop() {
   Serial.println("[HTTP /api/audio/stop]");
@@ -3243,29 +3289,6 @@ void handleAudioStop() {
   server.send(statusCode, "application/json", response);
 }
 
-// ── GET /api/audio/volume?volume=0-100 ───────────────────────────────────────
-void handleAudioVolume() {
-  if (!server.hasArg("volume")) {
-    server.send(400, "application/json", "{\"error\":\"missing volume\"}");
-    return;
-  }
-  const int requestedVolume = constrain(server.arg("volume").toInt(), 0, 100);
-  String response;
-  int statusCode = 0;
-  if (!requestSlaveAudio("/audio/volume?volume=" + String(requestedVolume), response, statusCode)) {
-    server.send(statusCode ? statusCode : 503, "application/json",
-                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
-    return;
-  }
-  volume = requestedVolume;
-  Serial.printf("[HTTP /api/audio/volume] volume=%d\n", volume);
-  if (page == P_AUDIO && gateState == GS_OPEN) {
-    drawPct(W - 10, BODY_Y + 166, volume, C_GREEN);
-    drawSlider(BODY_Y + 200, volume, C_GREEN);
-  }
-  server.send(statusCode, "application/json", response);
-}
-
 // ── GET /api/audio/files → list of files found on the slave SD card ──────────
 void handleAudioFiles() {
   String response;
@@ -3275,7 +3298,12 @@ void handleAudioFiles() {
                 response.length() ? response : "{\"error\":\"slave SD/audio controller unavailable\",\"files\":[]}");
     return;
   }
-  refreshSlaveAudioTracks();
+  if (!parseSlaveAudioTracks(response)) {
+    server.send(502, "application/json", "{\"error\":\"invalid track-list response from slave\",\"files\":[]}");
+    return;
+  }
+  Serial.printf("[AUDIO] Proxied %d track(s) from slave; SD=%s\n",
+                trackCount, sdOk ? "ready" : "not ready");
   server.send(statusCode, "application/json", response);
 }
 
@@ -3356,7 +3384,6 @@ void handleState() {
     "\"fountainAux\":%d,"
     "\"fountainForceSensorOn\":%s,"
     "\"drainagePumpOn\":%s,"
-    "\"volume\":%d,"
     "\"audioPlaying\":%s,"
     "\"audioTrack\":\"%s\","
     "\"fountainColor\":\"%s\","
@@ -3375,7 +3402,6 @@ void handleState() {
     fountainAux,
     forceSensorOn  ? "true" : "false",
     drainagePumpOn ? "true" : "false",
-    volume,
     audioPlaying   ? "true" : "false",
     trackName,
     leftHex,
@@ -3582,8 +3608,9 @@ void setupRoutes() {
   server.on("/api/gate/status",      HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/play",       HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/pause",      HTTP_OPTIONS, handleOptions);
+  server.on("/api/audio/next",       HTTP_OPTIONS, handleOptions);
+  server.on("/api/audio/previous",   HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/stop",       HTTP_OPTIONS, handleOptions);
-  server.on("/api/audio/volume",     HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/files",      HTTP_OPTIONS, handleOptions);
   server.on("/api/sound-reactive",   HTTP_OPTIONS, handleOptions);
   server.on("/api/sound",            HTTP_OPTIONS, handleOptions);
@@ -3608,8 +3635,9 @@ void setupRoutes() {
   server.on("/api/gate/status", HTTP_GET, []() { addCORSHeaders(); handleGateStatus(); });
   server.on("/api/audio/play",  HTTP_GET, []() { addCORSHeaders(); handleAudioPlay();  });
   server.on("/api/audio/pause", HTTP_GET, []() { addCORSHeaders(); handleAudioPause(); });
+  server.on("/api/audio/next", HTTP_GET, []() { addCORSHeaders(); handleAudioStep(1); });
+  server.on("/api/audio/previous", HTTP_GET, []() { addCORSHeaders(); handleAudioStep(-1); });
   server.on("/api/audio/stop",  HTTP_GET, []() { addCORSHeaders(); handleAudioStop();  });
-  server.on("/api/audio/volume",HTTP_GET, []() { addCORSHeaders(); handleAudioVolume();});
   server.on("/api/audio/files", HTTP_GET, []() { addCORSHeaders(); handleAudioFiles(); });
   server.on("/api/sound-reactive",HTTP_GET,[]() { addCORSHeaders(); handleSoundReactive(); });
   server.on("/api/sound",  HTTP_GET, []() { addCORSHeaders(); handleSound();        });
@@ -3846,6 +3874,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(PUMP_PWM_PIN, OUTPUT);
   analogWrite(PUMP_PWM_PIN, 0);
+  setupGateServo();
   setupEncoder();
   Serial.printf("[ENCODER] CLK=%d DT=%d SW=%d\n",
                 ENCODER_CLK_PIN, ENCODER_DT_PIN, ENCODER_SW_PIN);

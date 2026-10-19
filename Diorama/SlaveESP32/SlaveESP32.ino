@@ -3,39 +3,39 @@
   ─────────────────────────────────────────────────────────────────────────────
   Connects to the master ESP32 AP (Diorama-Park) as a WiFi station.
   Master sends mode + RGB + sound detection state; this board drives:
-  1. MOSFET PWM outputs for 3 RGB zones (Left, Right, Inner Circle)
+  1. Shared MOSFET PWM outputs for the three RGB zones
   2. ULN2003 stepper driver (IN1-IN4) for Inner Circle rotation on sound detection
 
   ── IMPORTANT (classic ESP32) ────────────────────────────────────────────────
   Do NOT use GPIO 6–11. They are wired to internal SPI flash.
 
   ── Safe wiring ──────────────────────────────────────────────────────────────
-  Group 1  Left Fountain  : R=GPIO4,  G=GPIO5,  B=GPIO18
-  Group 2  Right Fountain : R=GPIO19, G=GPIO22, B=GPIO32
-  Group 3  Inner Circle   : R=GPIO33, G=GPIO27, B=GPIO23
+  All groups share RGB inputs: R=GPIO4, G=GPIO22, B=GPIO32
   Force sensor            : analog output=GPIO36 (VP / ADC1)
 
   ── SPI microSD adapter ─────────────────────────────────────────────────────
-  SCK=GPIO21, MOSI=GPIO2, MISO=GPIO34, CS=GPIO15
-  GPIO2 and GPIO15 are boot-strapping pins; check adapter pull-ups and startup.
+  SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO21
   SdFat handles FAT16/FAT32 and exFAT; install the SdFat library.
 
   Audio playback requires the ESP8266Audio library and supports MP3/WAV files
-  directly inside /DIORAMA, output through the ESP32 built-in DAC.
+  directly inside /DIORAMA. WAV tracks must be 8- or 16-bit PCM stereo at
+  44.1 or 22.05 kHz; output uses the ESP32 built-in DAC.
 
   ── PAM8403 analog audio input ───────────────────────────────────────────────
-  DAC1=GPIO25 -> Left channel input, DAC2=GPIO26 -> Right channel input
+  Built-in DAC output: 44,100 Hz default, DAC1=GPIO25 -> Left input,
+  DAC2=GPIO26 -> Right input
 
   ── Motor Driver (ULN2003 + 28BYJ-48) ────────────────────────────────────────
-  Stepper inputs: IN1=GPIO13, IN2=GPIO14, IN3=GPIO16, IN4=GPIO17
+  Stepper inputs: IN1=GPIO13 , IN2=GPIO14, IN3=GPIO16, IN4=GPIO17
 
   ── API (master calls these) ─────────────────────────────────────────────────
   GET /rgb?group=1|2|3|all&r=&g=&b=&brightness=&mode=Basic|Colorful|Sound|Adaptive&sound=0|1
   GET /off?mode=...
   GET /motor?state=on|off&dir=fwd|rev
   GET /status
-  GET /audio/files, /audio/state, /audio/play?file=..., /audio/pause
-  GET /audio/stop, /audio/volume?volume=0-100
+  GET /audio/files, /audio/state, /audio/play?file=..., /audio/pause,
+      /audio/next, /audio/previous
+  GET /audio/stop
 */
 
 #include <SdFat.h>
@@ -47,7 +47,16 @@
 #include <AudioGenerator.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+#if __has_include(<AudioOutputInternalDAC.h>)
+#include <AudioOutputInternalDAC.h>
+#else
+#error "Update ESP8266Audio to a version that provides AudioOutputInternalDAC.h"
+#endif
+#else
 #include <AudioOutputI2S.h>
+#endif
+#include <strings.h>
 
 // ── WiFi (must match main ESP SoftAP) ─────────────────────────────────────────
 const char* WIFI_SSID     = "Diorama-Park";
@@ -58,19 +67,10 @@ const IPAddress GATEWAY_IP  (192, 168, 4,   1);
 const IPAddress SUBNET_MASK (255, 255, 255,  0);
 const IPAddress DNS_IP      (192, 168, 4,   1);
 
-// ── RGB LED pins — SAFE GPIOs only (never 6–11 on classic ESP32) ──────────────
-// Group 1: Left Fountain
-#define G1_R  4
-#define G1_G  5
-#define G1_B  18
-// Group 2: Right Fountain
-#define G2_R  19
-#define G2_G  22
-#define G2_B  32
-// Group 3: Inner Circle
-#define G3_R  33
-#define G3_G  27
-#define G3_B  23
+// The three physical RGB groups share one red, green, and blue driver input.
+constexpr uint8_t RGB_R_PIN = 4;
+constexpr uint8_t RGB_G_PIN = 22;
+constexpr uint8_t RGB_B_PIN = 32;
 
 // ── ULN2003 / 28BYJ-48 stepper input pins ─────────────────────────────────────
 constexpr uint8_t IN1_PIN = 13;
@@ -79,16 +79,45 @@ constexpr uint8_t IN3_PIN = 16;
 constexpr uint8_t IN4_PIN = 17;
 
 constexpr uint8_t FORCE_SENSOR_PIN = 36; // VP, ADC1 input-only pin
+constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 22050;
+constexpr uint8_t AUDIO_OUTPUT_CHANNELS = 2;
+constexpr float AUDIO_FIXED_GAIN = 1.0f;
+constexpr uint32_t AUDIO_WAV_BUFFER_BYTES = 4096;
+constexpr uint16_t AUDIO_DAC_BUFFER_BYTES = 2048;
+constexpr int AUDIO_I2S_DMA_BUFFER_COUNT = 16;
 
-// SD uses GPIO2 and GPIO15, which are boot-strapping pins on classic ESP32.
-constexpr uint8_t SD_SCK_PIN  = 21;
-constexpr uint8_t SD_MOSI_PIN = 2;
-constexpr uint8_t SD_MISO_PIN = 34;
-constexpr uint8_t SD_CS_PIN   = 15;
-constexpr uint32_t SD_SPI_FREQUENCY = 10000000;
+constexpr uint8_t SD_SCK_PIN  = 18;
+constexpr uint8_t SD_MOSI_PIN = 23;
+constexpr uint8_t SD_MISO_PIN = 19;
+constexpr uint8_t SD_CS_PIN  = 21;
+constexpr uint32_t SD_SPI_FREQUENCY = 8000000;
+constexpr uint32_t SD_SPI_FALLBACK_FREQUENCY = 4000000;
+constexpr uint32_t SD_SPI_SAFE_FREQUENCY = 1000000;
 SPIClass sdSPI(VSPI);
 SdFs sd;
 bool sdCardReady = false;
+
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+class GainAdjustedInternalDAC : public AudioOutputInternalDAC {
+public:
+  explicit GainAdjustedInternalDAC(uint16_t bufferSize)
+      : AudioOutputInternalDAC(bufferSize) {}
+
+  bool SetGain(float gain) override {
+    outputGain = constrain(gain, 0.0f, 4.0f);
+    return AudioOutputInternalDAC::SetGain(outputGain);
+  }
+
+  bool ConsumeSample(int16_t samples[2]) override {
+    samples[0] = static_cast<int16_t>(samples[0] * outputGain);
+    samples[1] = static_cast<int16_t>(samples[1] * outputGain);
+    return AudioOutputInternalDAC::ConsumeSample(samples);
+  }
+
+private:
+  float outputGain = AUDIO_FIXED_GAIN;
+};
+#endif
 
 class AudioFileSourceSdFat : public AudioFileSource {
 public:
@@ -157,11 +186,11 @@ constexpr uint8_t MAX_AUDIO_TRACKS = 24;
 char audioTracks[MAX_AUDIO_TRACKS][96];
 uint8_t audioTrackCount = 0;
 int8_t currentAudioTrack = -1;
-uint8_t audioVolume = 70;
+int8_t pendingAudioTrack = -1;
 bool audioPlaying = false;
 AudioFileSourceSdFat* audioSource = nullptr;
 AudioGenerator* audioDecoder = nullptr;
-AudioOutputI2S* audioOutput = nullptr;
+AudioOutput* audioOutput = nullptr;
 
 bool innerCircleMotorRunning = false;
 bool manualMotorRunning = false;
@@ -239,6 +268,96 @@ bool isSupportedAudioFile(const String& path) {
   return lower.endsWith(".mp3") || lower.endsWith(".wav");
 }
 
+bool readWavU16(FsFile& file, uint16_t& value) {
+  uint8_t bytes[2];
+  if (file.read(bytes, sizeof(bytes)) != sizeof(bytes)) return false;
+  value = static_cast<uint16_t>(bytes[0]) |
+          (static_cast<uint16_t>(bytes[1]) << 8);
+  return true;
+}
+
+bool readWavU32(FsFile& file, uint32_t& value) {
+  uint8_t bytes[4];
+  if (file.read(bytes, sizeof(bytes)) != sizeof(bytes)) return false;
+  value = static_cast<uint32_t>(bytes[0]) |
+          (static_cast<uint32_t>(bytes[1]) << 8) |
+          (static_cast<uint32_t>(bytes[2]) << 16) |
+          (static_cast<uint32_t>(bytes[3]) << 24);
+  return true;
+}
+
+bool validateWavFormat(const char* path) {
+  FsFile file;
+  if (!file.open(&sd, path, O_RDONLY)) {
+    Serial.printf("[AUDIO] ERROR: cannot inspect %s\n", path);
+    return false;
+  }
+
+  char riff[4], wave[4];
+  uint32_t riffSize;
+  const bool validHeader =
+      file.read(riff, sizeof(riff)) == sizeof(riff) &&
+      readWavU32(file, riffSize) &&
+      file.read(wave, sizeof(wave)) == sizeof(wave) &&
+      memcmp(riff, "RIFF", 4) == 0 &&
+      memcmp(wave, "WAVE", 4) == 0;
+  if (!validHeader) {
+    Serial.printf("[AUDIO] ERROR: %s is not a valid RIFF/WAVE file\n", path);
+    file.close();
+    return false;
+  }
+
+  bool foundFormat = false;
+  uint16_t encoding = 0, channels = 0, bitsPerSample = 0;
+  uint32_t sampleRate = 0;
+  const uint64_t fileSize = file.fileSize();
+  while (file.curPosition() + 8 <= fileSize) {
+    char chunkId[4];
+    uint32_t chunkSize;
+    if (file.read(chunkId, sizeof(chunkId)) != sizeof(chunkId) ||
+        !readWavU32(file, chunkSize)) {
+      break;
+    }
+
+    const uint64_t chunkData = file.curPosition();
+    if (memcmp(chunkId, "fmt ", 4) == 0) {
+      uint32_t byteRate;
+      uint16_t blockAlign;
+      if (chunkSize < 16 ||
+          !readWavU16(file, encoding) ||
+          !readWavU16(file, channels) ||
+          !readWavU32(file, sampleRate) ||
+          !readWavU32(file, byteRate) ||
+          !readWavU16(file, blockAlign) ||
+          !readWavU16(file, bitsPerSample)) {
+        break;
+      }
+      foundFormat = true;
+    } else if (memcmp(chunkId, "data", 4) == 0) {
+      break;
+    }
+
+    const uint64_t nextChunk = chunkData + chunkSize + (chunkSize & 1U);
+    if (nextChunk > fileSize || !file.seekSet(nextChunk)) break;
+  }
+  file.close();
+
+  if (!foundFormat || encoding != 1 || channels != AUDIO_OUTPUT_CHANNELS ||
+      (bitsPerSample != 8 && bitsPerSample != 16) ||
+      (sampleRate != 44100 && sampleRate != 22050)) {
+    Serial.printf(
+        "[AUDIO] ERROR: %s must be 8- or 16-bit PCM stereo at 44100 or 22050 Hz"
+        " (found PCM=%u, channels=%u, bits=%u, rate=%lu Hz)\n",
+        path, encoding, channels, bitsPerSample,
+        static_cast<unsigned long>(sampleRate));
+    return false;
+  }
+
+  Serial.printf("[AUDIO] WAV format OK: %u-bit PCM stereo, %lu Hz\n",
+                bitsPerSample, static_cast<unsigned long>(sampleRate));
+  return true;
+}
+
 void scanAudioTracks() {
   audioTrackCount = 0;
   if (!sdCardReady) return;
@@ -286,6 +405,7 @@ void stopAudioDecoder() {
     delete audioDecoder;
     audioDecoder = nullptr;
   }
+  if (audioOutput) audioOutput->stop();
   if (audioSource) {
     audioSource->close();
     delete audioSource;
@@ -308,9 +428,18 @@ bool startAudioTrack(uint8_t index) {
   String path = audioTracks[index];
   path.toLowerCase();
   if (path.endsWith(".mp3")) audioDecoder = new AudioGeneratorMP3();
-  else if (path.endsWith(".wav")) audioDecoder = new AudioGeneratorWAV();
+  else if (path.endsWith(".wav")) {
+    if (!validateWavFormat(audioTracks[index])) {
+      stopAudioDecoder();
+      return false;
+    }
+    AudioGeneratorWAV* wavDecoder = new AudioGeneratorWAV();
+    wavDecoder->SetBufferSize(AUDIO_WAV_BUFFER_BYTES);
+    audioDecoder = wavDecoder;
+  }
 
   if (!audioDecoder || !audioOutput ||
+      !audioOutput->SetGain(AUDIO_FIXED_GAIN) ||
       !audioDecoder->begin(audioSource, audioOutput)) {
     Serial.printf("[AUDIO] ERROR: decoder could not start for %s\n", audioTracks[index]);
     stopAudioDecoder();
@@ -340,8 +469,35 @@ String jsonQuoted(const char* value) {
 }
 
 void serviceAudioPlayback() {
+  if (pendingAudioTrack >= 0) {
+    const uint8_t requestedTrack = static_cast<uint8_t>(pendingAudioTrack);
+    pendingAudioTrack = -1;
+    if (!startAudioTrack(requestedTrack)) {
+      currentAudioTrack = -1;
+      Serial.printf("[AUDIO] ERROR: queued track %u failed to start\n",
+                    requestedTrack + 1);
+    }
+    return;
+  }
+
   if (!audioPlaying || !audioDecoder) return;
   if (audioDecoder->loop()) return;
+
+  const uint32_t sourcePosition = audioSource ? audioSource->getPos() : 0;
+  const uint32_t sourceSize = audioSource ? audioSource->getSize() : 0;
+  const bool reachedEndOfFile = audioSource && sourcePosition >= sourceSize;
+  Serial.printf("[AUDIO] Decoder stopped at %lu/%lu bytes (%s)\n",
+                static_cast<unsigned long>(sourcePosition),
+                static_cast<unsigned long>(sourceSize),
+                reachedEndOfFile ? "end of file" : "before end of file");
+  if (!reachedEndOfFile) {
+    if (sd.card()) {
+      Serial.printf("[AUDIO] SD card error after decoder stop: code=0x%02X data=0x%02X\n",
+                    sd.card()->errorCode(), sd.card()->errorData());
+    }
+    stopAudioDecoder();
+    return;
+  }
 
   const int8_t nextTrack = currentAudioTrack + 1;
   if (nextTrack >= 0 && nextTrack < audioTrackCount) {
@@ -386,18 +542,10 @@ void writeRGB(uint8_t pinR, uint8_t pinG, uint8_t pinB,
   analogWrite(pinB, 255 - (uint8_t)((uint32_t)b * br / 100));
 }
 
-void pushGroup(int idx) {
-  const GroupState& g = groups[idx];
-  uint8_t br = g.on ? g.brightness : 0;
-  switch (idx) {
-    case 0: writeRGB(G1_R, G1_G, G1_B, g.r, g.g, g.b, br); break;
-    case 1: writeRGB(G2_R, G2_G, G2_B, g.r, g.g, g.b, br); break;
-    case 2: writeRGB(G3_R, G3_G, G3_B, g.r, g.g, g.b, br); break;
-  }
-}
-
 void pushAllGroups() {
-  for (int i = 0; i < 3; i++) pushGroup(i);
+  const GroupState& g = groups[0];
+  uint8_t br = g.on ? g.brightness : 0;
+  writeRGB(RGB_R_PIN, RGB_G_PIN, RGB_B_PIN, g.r, g.g, g.b, br);
 }
 
 void allOff() {
@@ -441,8 +589,8 @@ void handleRGB() {
   if (grp == "all") {
     for (int i = 0; i < 3; i++) {
       groups[i] = {r, g, b, br, true};
-      pushGroup(i);
     }
+    pushAllGroups();
     Serial.printf("[RGB] mode=%s ALL #%02X%02X%02X br=%d sound=%d\n",
                   lightMode.c_str(), r, g, b, br, soundParam ? 1 : 0);
   } else {
@@ -451,8 +599,10 @@ void handleRGB() {
       server.send(400, "application/json", "{\"error\":\"group must be 1,2,3 or all\"}");
       return;
     }
-    groups[idx] = {r, g, b, br, true};
-    pushGroup(idx);
+    for (int i = 0; i < 3; i++) {
+      groups[i] = {r, g, b, br, true};
+    }
+    pushAllGroups();
     Serial.printf("[RGB] mode=%s G%d #%02X%02X%02X br=%d sound=%d\n",
                   lightMode.c_str(), idx + 1, r, g, b, br, soundParam ? 1 : 0);
   }
@@ -496,13 +646,15 @@ void handleMotor() {
 }
 
 void handleForceSensor() {
-  const int raw = analogRead(FORCE_SENSOR_PIN);
-  const float rawF = constrain(raw, 0, 4095) / 4096.0f;
-  const int scaled = static_cast<int>(255.0f * powf(rawF, 6.767f));
-  const int level = scaled * 1023 / 255;
+  uint32_t rawTotal = 0;
+  for (uint8_t sample = 0; sample < 8; ++sample) {
+    rawTotal += analogRead(FORCE_SENSOR_PIN);
+  }
+  const uint16_t raw = static_cast<uint16_t>((rawTotal + 4) / 8);
+  const uint16_t level = static_cast<uint16_t>((raw * 1023U + 2047U) / 4095U);
 
-  char response[32];
-  snprintf(response, sizeof(response), "{\"level\":%d}", level);
+  char response[48];
+  snprintf(response, sizeof(response), "{\"raw\":%u,\"level\":%u}", raw, level);
   server.send(200, "application/json", response);
 }
 
@@ -537,8 +689,6 @@ void handleAudioState() {
   json += jsonQuoted(title.c_str());
   json += ",\"playing\":";
   json += audioPlaying ? "true" : "false";
-  json += ",\"volume\":";
-  json += String(audioVolume);
   json += ",\"trackCount\":";
   json += String(audioTrackCount);
   json += "}";
@@ -547,11 +697,15 @@ void handleAudioState() {
 
 void handleAudioPlay() {
   addCORS();
+  Serial.printf("[MASTER CMD] PLAY received: %s\n",
+                server.hasArg("file") ? server.arg("file").c_str() : "(missing file)");
   if (!sdCardReady) {
+    Serial.println("[AUDIO] Play request rejected: SD card is not mounted");
     server.send(503, "application/json", "{\"error\":\"SD card is not mounted\"}");
     return;
   }
   if (!server.hasArg("file")) {
+    Serial.println("[AUDIO] Play request rejected: missing file parameter");
     server.send(400, "application/json", "{\"error\":\"missing file\"}");
     return;
   }
@@ -559,39 +713,87 @@ void handleAudioPlay() {
   const String requested = server.arg("file");
   for (uint8_t i = 0; i < audioTrackCount; ++i) {
     if (requested == audioTracks[i]) {
-      if (currentAudioTrack == i && audioDecoder) {
+      if (pendingAudioTrack == i) {
+        Serial.printf("[AUDIO] Play request already queued for %u/%u: %s\n",
+                      i + 1, audioTrackCount, audioTracks[i]);
+        server.send(200, "application/json", "{\"ok\":true,\"queued\":true}");
+      } else if (currentAudioTrack == i && audioDecoder) {
+        if (!audioOutput || !audioOutput->SetGain(AUDIO_FIXED_GAIN)) {
+          Serial.println("[AUDIO] ERROR: could not restore audio output gain");
+          server.send(500, "application/json", "{\"error\":\"could not resume audio output\"}");
+          return;
+        }
         audioPlaying = true;
-        server.send(200, "application/json", "{\"ok\":true}");
-      } else if (startAudioTrack(i)) {
+        Serial.printf("[AUDIO] Resume request accepted for %u/%u: %s\n",
+                      i + 1, audioTrackCount, audioTracks[i]);
         server.send(200, "application/json", "{\"ok\":true}");
       } else {
-        server.send(500, "application/json", "{\"error\":\"audio decoder failed to start\"}");
+        pendingAudioTrack = static_cast<int8_t>(i);
+        Serial.printf("[AUDIO] Play/track-change request queued %u/%u: %s\n",
+                      i + 1, audioTrackCount, audioTracks[i]);
+        server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
       }
       return;
     }
   }
+  Serial.println("[AUDIO] Play request rejected: track not found in playlist");
   server.send(404, "application/json", "{\"error\":\"track not found in /DIORAMA\"}");
 }
 
 void handleAudioPause() {
   addCORS();
-  if (audioDecoder) audioPlaying = false;
+  Serial.printf("[MASTER CMD] PAUSE received (playing=%s, track=%d/%u)\n",
+                audioPlaying ? "yes" : "no",
+                currentAudioTrack >= 0 ? currentAudioTrack + 1 : 0,
+                audioTrackCount);
+  pendingAudioTrack = -1;
+  if (!audioDecoder) {
+    Serial.println("[AUDIO] Pause ignored: no active decoder");
+    server.send(409, "application/json", "{\"error\":\"no active audio track\"}");
+    return;
+  }
+  if (!audioOutput || !audioOutput->SetGain(0.0f)) {
+    Serial.println("[AUDIO] ERROR: could not mute audio output for pause");
+    server.send(500, "application/json", "{\"error\":\"could not mute audio output\"}");
+    return;
+  }
+  audioOutput->flush();
+  audioPlaying = false;
+  Serial.println("[AUDIO] Playback paused; output buffer flushed");
   server.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleAudioStep(int8_t direction) {
+  addCORS();
+  Serial.printf("[MASTER CMD] %s received\n",
+                direction > 0 ? "NEXT" : "PREV");
+  if (!sdCardReady || !audioTrackCount) {
+    Serial.println("[AUDIO] Track-step request rejected: playlist unavailable");
+    server.send(503, "application/json", "{\"error\":\"audio playlist unavailable\"}");
+    return;
+  }
+
+  const int8_t baseTrack = pendingAudioTrack >= 0
+    ? pendingAudioTrack
+    : currentAudioTrack;
+  const uint8_t nextTrack = baseTrack >= 0
+    ? static_cast<uint8_t>((baseTrack + direction + audioTrackCount) % audioTrackCount)
+    : (direction > 0 ? 0 : audioTrackCount - 1);
+  pendingAudioTrack = static_cast<int8_t>(nextTrack);
+
+  Serial.printf("[AUDIO] %s queued: track %u/%u: %s\n",
+                direction > 0 ? "NEXT" : "PREV",
+                nextTrack + 1, audioTrackCount, audioTracks[nextTrack]);
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
 
 void handleAudioStop() {
   addCORS();
+  Serial.println("[AUDIO] Stop request received");
+  pendingAudioTrack = -1;
   stopAudioDecoder();
   currentAudioTrack = -1;
-  server.send(200, "application/json", "{\"ok\":true}");
-}
-
-void handleAudioVolume() {
-  addCORS();
-  if (server.hasArg("volume")) {
-    audioVolume = constrain(server.arg("volume").toInt(), 0, 100);
-    if (audioOutput) audioOutput->SetGain(audioVolume / 100.0f);
-  }
+  Serial.println("[AUDIO] Playback stopped");
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
@@ -634,8 +836,9 @@ void startHttpServer() {
   server.on("/audio/state", HTTP_GET, handleAudioState);
   server.on("/audio/play", HTTP_GET, handleAudioPlay);
   server.on("/audio/pause", HTTP_GET, handleAudioPause);
+  server.on("/audio/next", HTTP_GET, []() { handleAudioStep(1); });
+  server.on("/audio/previous", HTTP_GET, []() { handleAudioStep(-1); });
   server.on("/audio/stop", HTTP_GET, handleAudioStop);
-  server.on("/audio/volume", HTTP_GET, handleAudioVolume);
   server.on("/rgb",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/off",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/motor",  HTTP_OPTIONS, []() { addCORS(); server.send(204); });
@@ -644,8 +847,9 @@ void startHttpServer() {
   server.on("/audio/state", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/play", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/pause", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
+  server.on("/audio/next", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
+  server.on("/audio/previous", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/stop", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
-  server.on("/audio/volume", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.begin();
   httpStarted = true;
   Serial.printf("[HTTP] Listening on http://%s/status\n", WiFi.localIP().toString().c_str());
@@ -676,18 +880,18 @@ void setup() {
   delay(500);
   Serial.println();
   Serial.println("[SLAVE] Diorama RGB & Inner Circle Motor Slave starting...");
-  Serial.println("[SLAVE] RGB pins: G1=4/5/18  G2=19/22/32  G3=33/27/23");
+  Serial.println("[SLAVE] Shared RGB pins: R=4, G=22, B=32");
   Serial.println("[AUDIO] PAM8403 analog inputs: GPIO25/26 (built-in DAC)");
   Serial.println("[SLAVE] Motor pins: IN1=13, IN2=14, IN3=16, IN4=17");
-  Serial.println("[SD] SPI pins: SCK=21, MOSI=2, MISO=34, CS=15 (GPIO2/15 are boot straps)");
+  Serial.println("[SD] SPI pins: SCK=18, MOSI=23, MISO=19, CS=21");
 
   // Init PWM pins OFF (inverted)
-  const uint8_t pins[] = {G1_R, G1_G, G1_B, G2_R, G2_G, G2_B, G3_R, G3_G, G3_B};
+  const uint8_t pins[] = {RGB_R_PIN, RGB_G_PIN, RGB_B_PIN};
   for (uint8_t p : pins) {
     pinMode(p, OUTPUT);
     analogWrite(p, 255);  // off
   }
-  Serial.println("[PWM] 9 safe pins ready, all OFF");
+  Serial.println("[PWM] 3 shared RGB outputs ready, all OFF");
 
   // Init Motor Pins OFF
   pinMode(IN1_PIN, OUTPUT);
@@ -702,9 +906,30 @@ void setup() {
   analogSetPinAttenuation(FORCE_SENSOR_PIN, ADC_11db);
   Serial.println("[FORCE SENSOR] Analog input ready on GPIO36 (VP)");
 
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
   sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  sdCardReady = sd.begin(SdSpiConfig(
-    SD_CS_PIN, DEDICATED_SPI, SD_SCK_HZ(SD_SPI_FREQUENCY), &sdSPI));
+  const uint32_t sdFrequencies[] = {
+    SD_SPI_FREQUENCY,
+    SD_SPI_FALLBACK_FREQUENCY,
+    SD_SPI_SAFE_FREQUENCY
+  };
+  for (uint8_t attempt = 0; attempt < sizeof(sdFrequencies) / sizeof(sdFrequencies[0]); ++attempt) {
+    const uint32_t frequency = sdFrequencies[attempt];
+    Serial.printf("[SD] Mount attempt %u at %lu Hz\n",
+                  attempt + 1, static_cast<unsigned long>(frequency));
+    sdCardReady = sd.begin(SdSpiConfig(
+      SD_CS_PIN, DEDICATED_SPI, SD_SCK_HZ(frequency), &sdSPI));
+    if (sdCardReady) break;
+
+    if (sd.card()) {
+      Serial.printf("[SD] Attempt failed: code=0x%02X data=0x%02X\n",
+                    sd.card()->errorCode(), sd.card()->errorData());
+    } else {
+      Serial.println("[SD] Attempt failed: no card object returned");
+    }
+    delay(100);
+  }
   if (sdCardReady) {
     const uint8_t filesystemType = sd.fatType();
     if (filesystemType == 64) {
@@ -713,16 +938,41 @@ void setup() {
       Serial.printf("[SD] Card mounted; filesystem: FAT%u\n", filesystemType);
     }
   } else {
-    Serial.println("[SD] ERROR: card mount failed; check wiring, card format, voltage, and strap-pin startup levels");
+    Serial.println("[SD] ERROR: card mount failed");
+    Serial.printf("[SD] SPI pins: SCK=%u MOSI=%u MISO=%u CS=%u; attempted %lu, %lu, and %lu Hz\n",
+                  SD_SCK_PIN, SD_MOSI_PIN, SD_MISO_PIN, SD_CS_PIN,
+                  static_cast<unsigned long>(SD_SPI_FREQUENCY),
+                  static_cast<unsigned long>(SD_SPI_FALLBACK_FREQUENCY),
+                  static_cast<unsigned long>(SD_SPI_SAFE_FREQUENCY));
+    if (sd.card()) {
+      Serial.printf("[SD] SdFat card error: code=0x%02X data=0x%02X\n",
+                    sd.card()->errorCode(), sd.card()->errorData());
+    } else {
+      Serial.println("[SD] SdFat did not return a card object; check card power, seating, and SPI wiring");
+    }
   }
   if (sdCardReady) {
     scanAudioTracks();
-    audioOutput = new AudioOutputI2S(0, AudioOutputI2S::INTERNAL_DAC);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    audioOutput = new GainAdjustedInternalDAC(AUDIO_DAC_BUFFER_BYTES);
+#else
+    audioOutput = new AudioOutputI2S(
+      0, AudioOutputI2S::INTERNAL_DAC, AUDIO_I2S_DMA_BUFFER_COUNT,
+      AudioOutputI2S::APLL_ENABLE);
+#endif
     if (!audioOutput) {
       Serial.println("[AUDIO] ERROR: could not allocate internal DAC output");
+    } else if (!audioOutput->SetRate(AUDIO_DEFAULT_SAMPLE_RATE_HZ) ||
+               !audioOutput->SetChannels(AUDIO_OUTPUT_CHANNELS)) {
+      Serial.println("[AUDIO] ERROR: could not configure default 44100 Hz stereo output");
+      delete audioOutput;
+      audioOutput = nullptr;
     } else {
-      audioOutput->SetGain(audioVolume / 100.0f);
-      Serial.println("[AUDIO] Internal DAC output ready on GPIO25/26");
+      audioOutput->SetGain(AUDIO_FIXED_GAIN);
+      Serial.printf("[AUDIO] Internal DAC ready on GPIO25/26; default=%lu Hz stereo, fixed gain %.2f\n",
+                    static_cast<unsigned long>(AUDIO_DEFAULT_SAMPLE_RATE_HZ),
+                    AUDIO_FIXED_GAIN);
+      Serial.println("[AUDIO] Decoder will set the stream rate from each file's metadata");
     }
   }
 
@@ -764,7 +1014,7 @@ void loop() {
     }
 
     startHttpServer();
-    allOff();
+    pushAllGroups();
     stopMotors();
     Serial.println("[SLAVE] Ready — waiting for master /rgb commands");
   }

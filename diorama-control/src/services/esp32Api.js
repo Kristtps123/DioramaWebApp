@@ -107,10 +107,6 @@ export const sendModeControl = (mode) => {
   });
 };
 
-export const sendVolumeControl = (volume) => {
-  return sendEspCommand('/api/audio/volume', { volume });
-};
-
 export const sendSoundReactive = (isOn, intensity = 65) => {
   return sendEspCommand('/api/sound-reactive', {
     state: isOn ? 'on' : 'off',
@@ -191,11 +187,11 @@ export const getAudioFiles = async () => {
     const timeoutId = setTimeout(() => controller.abort(), 3000);
     const response = await fetch(url, { signal: controller.signal, mode: 'cors' });
     clearTimeout(timeoutId);
-    if (!response.ok) return [];
+    if (!response.ok) return null;
     const data = await response.json();
-    return Array.isArray(data.files) ? data.files : [];
+    return Array.isArray(data.files) ? data.files : null;
   } catch {
-    return [];
+    return null;
   }
 };
 
@@ -210,6 +206,12 @@ export const sendAudioPlay = (filename) =>
  * Tell the ESP32 to pause playback.
  */
 export const sendAudioPause = () => sendEspCommand('/api/audio/pause');
+
+/**
+ * Ask the main ESP32 to select and play the adjacent slave playlist track.
+ */
+export const sendAudioNext = () => sendEspCommand('/api/audio/next');
+export const sendAudioPrevious = () => sendEspCommand('/api/audio/previous');
 
 /**
  * Tell the ESP32 to stop playback.

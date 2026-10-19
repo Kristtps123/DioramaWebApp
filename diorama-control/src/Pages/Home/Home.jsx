@@ -18,7 +18,7 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
     lightsOn, brightness, lightingMode,
     reactionIntensity,
     fountainOn, fountainStrength, fountainColor,
-    audioPlaying, audioTrack, volume,
+    audioPlaying, audioTrack,
     autoDimming, circleColor, gateOpen
   } = appState;
   const lightingModeLabel = lightingMode === 'Colorful' ? 'Custom Color' : lightingMode;
@@ -225,20 +225,6 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
             </button>
           </div>
 
-          <div className="card-slider-group">
-            <div className="slider-label-row">
-              <span>Volume</span>
-              <span className="value-label">{volume}%</span>
-            </div>
-            <input
-              type="range"
-              min="0"
-              max="100"
-              value={volume}
-              className="custom-range-slider"
-              onChange={(e) => setAppState((prev) => ({ ...prev, volume: Number(e.target.value) }))}
-            />
-          </div>
         </div>
 
         {/* 4. BIOMETRIC GATE CARD */}

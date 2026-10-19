@@ -15,7 +15,6 @@ import {
   sendColorControl,
   sendGateControl,
   sendModeControl,
-  sendVolumeControl,
   sendSoundReactive,
   sendForceSensorControl,
   getEsp32State
@@ -62,7 +61,6 @@ function App() {
 
     audioPlaying: false,
     audioTrack: 'No audio selected',
-    volume: 70,
 
     circleColor: '#D4B78C',
     colorSensorTarget: 'All',
@@ -141,7 +139,6 @@ function App() {
         set('fountainAuxStrength', s.fountainAux);
         set('fountainForceSensorOn', s.fountainForceSensorOn);
         set('drainagePumpOn',   s.drainagePumpOn);
-        set('volume',           s.volume);
         set('audioPlaying',     s.audioPlaying);
         set('audioTrack',       s.audioTrack || 'No audio selected');
         set('fountainColor',    s.fountainColor);
@@ -207,9 +204,6 @@ function App() {
             sendColorControl(next.circleColor, 'center');
           }
         }
-      }
-      if (next.volume !== prev.volume) {
-        sendVolumeControl(next.volume);
       }
       if (next.soundReactiveOn !== prev.soundReactiveOn || next.reactionIntensity !== prev.reactionIntensity) {
         sendSoundReactive(next.soundReactiveOn, next.reactionIntensity);
