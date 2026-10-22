@@ -91,9 +91,10 @@ bool intakePumpOn = false;
 bool drainPumpOn = false;
 
 constexpr uint8_t FORCE_SENSOR_PIN = 36; // VP, ADC1 input-only pin
-constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 44100;
+constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 11025;
 constexpr uint8_t AUDIO_OUTPUT_CHANNELS = 2;
-constexpr float AUDIO_FIXED_GAIN = 1.0f;
+constexpr float AUDIO_FIXED_GAIN = 0.3f;
+constexpr float AUDIO_DIGITAL_BOOST = 0.7f; // About +3.5 dB; peaks are limited to 16-bit range.
 constexpr uint32_t AUDIO_WAV_BUFFER_BYTES = 4096;
 constexpr uint16_t AUDIO_DAC_BUFFER_BYTES = 2048;
 constexpr int AUDIO_I2S_DMA_BUFFER_COUNT = 16;
@@ -129,14 +130,14 @@ public:
   }
 
   bool SetGain(float gain) override {
-    outputGain = constrain(gain, 0.0f, 4.0f);
-    return AudioOutputInternalDAC::SetGain(outputGain);
+    outputGain = constrain(gain, 0.0f, 1.0f);
+    return AudioOutputInternalDAC::SetGain(1.0f);
   }
 
   bool ConsumeSample(int16_t samples[2]) override {
     if (audioCommandPending) return false;
     for (uint8_t channel = 0; channel < AUDIO_OUTPUT_CHANNELS; ++channel) {
-      const float amplified = samples[channel] * outputGain;
+      const float amplified = samples[channel] * outputGain * AUDIO_DIGITAL_BOOST;
       samples[channel] = static_cast<int16_t>(
           constrain(amplified, -32767.0f, 32767.0f));
     }
@@ -152,6 +153,11 @@ public:
   RateTrackingAudioOutputI2S(int port, int outputMode, int dmaBufferCount, int useApll)
       : AudioOutputI2S(port, outputMode, dmaBufferCount, useApll) {}
 
+  bool SetGain(float gain) override {
+    outputGain = constrain(gain, 0.0f, 1.0f);
+    return AudioOutputI2S::SetGain(1.0f);
+  }
+
   bool SetRate(int rate) override {
     if (!AudioOutputI2S::SetRate(rate)) return false;
     audioOutputSampleRateHz = rate;
@@ -159,8 +165,17 @@ public:
   }
 
   bool ConsumeSample(int16_t samples[2]) override {
-    return !audioCommandPending && AudioOutputI2S::ConsumeSample(samples);
+    if (audioCommandPending) return false;
+    for (uint8_t channel = 0; channel < AUDIO_OUTPUT_CHANNELS; ++channel) {
+      const float amplified = samples[channel] * outputGain * AUDIO_DIGITAL_BOOST;
+      samples[channel] = static_cast<int16_t>(
+          constrain(amplified, -32767.0f, 32767.0f));
+    }
+    return AudioOutputI2S::ConsumeSample(samples);
   }
+
+private:
+  float outputGain = AUDIO_FIXED_GAIN;
 };
 #endif
 
@@ -1162,9 +1177,9 @@ void setup() {
       audioOutput = nullptr;
     } else {
       audioOutput->SetGain(AUDIO_FIXED_GAIN);
-      Serial.printf("[AUDIO] Internal DAC ready on GPIO25/26; default=%lu Hz stereo, fixed gain %.2f\n",
+      Serial.printf("[AUDIO] Internal DAC ready on GPIO25/26; default=%lu Hz stereo, digital boost %.2fx\n",
                     static_cast<unsigned long>(AUDIO_DEFAULT_SAMPLE_RATE_HZ),
-                    AUDIO_FIXED_GAIN);
+                    AUDIO_DIGITAL_BOOST);
       Serial.println("[AUDIO] Decoder will set the stream rate from each file's metadata");
     }
   }

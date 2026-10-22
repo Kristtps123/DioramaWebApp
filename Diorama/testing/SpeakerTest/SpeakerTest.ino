@@ -38,21 +38,39 @@ constexpr uint32_t SD_SPI_SAFE_FREQUENCY = 1000000;
 constexpr char AUDIO_DIRECTORY[] = "/DIORAMA";
 constexpr uint8_t MAX_AUDIO_TRACKS = 24;
 constexpr uint32_t AUDIO_SAMPLE_RATE_HZ = 44100;
-constexpr float AUDIO_GAIN = 1.0f;
+constexpr float AUDIO_DIGITAL_BOOST = 1.5f; // About +3.5 dB; peaks are limited to 16-bit range.
 constexpr uint32_t AUDIO_WAV_BUFFER_BYTES = 4096;
 constexpr uint16_t AUDIO_DAC_BUFFER_BYTES = 2048;
 constexpr int AUDIO_I2S_DMA_BUFFER_COUNT = 16;
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-class AttenuatedInternalDAC : public AudioOutputInternalDAC {
+class BoostedInternalDAC : public AudioOutputInternalDAC {
 public:
-  explicit AttenuatedInternalDAC(uint16_t bufferSize)
+  explicit BoostedInternalDAC(uint16_t bufferSize)
       : AudioOutputInternalDAC(bufferSize) {}
 
   bool ConsumeSample(int16_t samples[2]) override {
-    samples[0] = static_cast<int16_t>(samples[0] * AUDIO_GAIN);
-    samples[1] = static_cast<int16_t>(samples[1] * AUDIO_GAIN);
+    for (uint8_t channel = 0; channel < 2; ++channel) {
+      const float amplified = samples[channel] * AUDIO_DIGITAL_BOOST;
+      samples[channel] = static_cast<int16_t>(
+          constrain(amplified, -32767.0f, 32767.0f));
+    }
     return AudioOutputInternalDAC::ConsumeSample(samples);
+  }
+};
+#else
+class BoostedAudioOutputI2S : public AudioOutputI2S {
+public:
+  BoostedAudioOutputI2S(int port, int outputMode, int dmaBufferCount, int useApll)
+      : AudioOutputI2S(port, outputMode, dmaBufferCount, useApll) {}
+
+  bool ConsumeSample(int16_t samples[2]) override {
+    for (uint8_t channel = 0; channel < 2; ++channel) {
+      const float amplified = samples[channel] * AUDIO_DIGITAL_BOOST;
+      samples[channel] = static_cast<int16_t>(
+          constrain(amplified, -32767.0f, 32767.0f));
+    }
+    return AudioOutputI2S::ConsumeSample(samples);
   }
 };
 #endif
@@ -413,9 +431,9 @@ void setup() {
   }
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-  audioOutput = new AttenuatedInternalDAC(AUDIO_DAC_BUFFER_BYTES);
+  audioOutput = new BoostedInternalDAC(AUDIO_DAC_BUFFER_BYTES);
 #else
-  audioOutput = new AudioOutputI2S(
+  audioOutput = new BoostedAudioOutputI2S(
       0, AudioOutputI2S::INTERNAL_DAC, AUDIO_I2S_DMA_BUFFER_COUNT,
       AudioOutputI2S::APLL_ENABLE);
 #endif
@@ -423,9 +441,12 @@ void setup() {
     Serial.println("[AUDIO] ERROR: could not allocate internal DAC output");
     return;
   }
-  audioOutput->SetGain(AUDIO_GAIN);
-  Serial.printf("[AUDIO] Internal DAC output ready, default %lu Hz, gain %.2f\n",
-                static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ), AUDIO_GAIN);
+  if (!audioOutput->SetGain(1.0f)) {
+    Serial.println("[AUDIO] ERROR: could not configure output gain");
+    return;
+  }
+  Serial.printf("[AUDIO] Internal DAC output ready, default %lu Hz, digital boost %.2fx\n",
+                static_cast<unsigned long>(AUDIO_SAMPLE_RATE_HZ), AUDIO_DIGITAL_BOOST);
   Serial.println("[AUDIO] Decoder will set the actual sample rate and channels from the track");
 
   if (!startAudioTrack(0)) {
