@@ -63,6 +63,12 @@ export const sendDrainagePumpControl = (isOn) => {
   });
 };
 
+export const sendIntakePumpControl = (isOn) => {
+  return sendEspCommand('/api/intake-pump', {
+    state: isOn ? 'on' : 'off'
+  });
+};
+
 export const sendColorControl = (hexColor, target = 'left') => {
   // Convert hex #RRGGBB to R, G, B ints
   const cleanHex = hexColor.replace('#', '');

@@ -7,7 +7,7 @@ import './About.css';
 
 const features = [
   { icon: <Lightbulb size={20} />, title: 'Adaptive Lighting', desc: 'RGB LED lights with basic white, custom color, sound-reactive, and ambient-adaptive modes.' },
-  { icon: <Droplets size={20} />, title: 'Three-Pump Water System', desc: 'The first two pumps retain their fountain functions; a third suction pump is intended to drain water from the tank. The drainage pump hardware pin is pending configuration.' },
+  { icon: <Droplets size={20} />, title: 'Four-Pump Water System', desc: 'Two pumps power the fountain, one pump drains water from the tank, and a fourth pump returns water to the reservoir.' },
   { icon: <RotateCcw size={20} />, title: 'Rotating Inner Plaza', desc: 'The central colonnade plaza can rotate continuously, on demand, or only when the mic detects sound.' },
   { icon: <Music size={20} />, title: 'Ambient Audio', desc: 'Pre-recorded soundscapes play directly into the diorama, bringing the miniature world to life.' },
   { icon: <Fingerprint size={20} />, title: 'Biometric Sensor Access', desc: 'A registered fingerprint on the biometric sensor is required to unlock the gate and access and interact with the diorama features.' },

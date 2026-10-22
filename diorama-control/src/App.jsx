@@ -11,6 +11,7 @@ import FingerprintRegisterModal from './components/FingerprintRegisterModal';
 import {
   sendLightControl,
   sendFountainControl,
+  sendIntakePumpControl,
   sendDrainagePumpControl,
   sendColorControl,
   sendGateControl,
@@ -54,6 +55,7 @@ function App() {
     fountainStrength: 100,
     fountainAuxStrength: 100,
     fountainForceSensorOn: false,
+    intakePumpOn: false,
     drainagePumpOn: false,
 
     fountainColor: '#77898D',
@@ -138,6 +140,7 @@ function App() {
         set('fountainStrength', s.fountainStr);
         set('fountainAuxStrength', s.fountainAux);
         set('fountainForceSensorOn', s.fountainForceSensorOn);
+        set('intakePumpOn',      s.intakePumpOn);
         set('drainagePumpOn',   s.drainagePumpOn);
         set('audioPlaying',     s.audioPlaying);
         set('audioTrack',       s.audioTrack || 'No audio selected');
@@ -177,11 +180,14 @@ function App() {
       if (next.drainagePumpOn !== prev.drainagePumpOn) {
         sendDrainagePumpControl(next.drainagePumpOn);
       }
+      if (next.intakePumpOn !== prev.intakePumpOn) {
+        sendIntakePumpControl(next.intakePumpOn);
+      }
       // Mode first — Basic locks slave to white before any color traffic.
       if (next.lightingMode !== prev.lightingMode) {
         sendModeControl(next.lightingMode);
       }
-      // Custom Color mirrors the automatic sensor scan across every zone.
+      // Keep a captured Custom Color synchronized across every zone.
       if (next.lightingMode === 'Colorful') {
         const colorChanged =
           next.fountainColor !== prev.fountainColor ||

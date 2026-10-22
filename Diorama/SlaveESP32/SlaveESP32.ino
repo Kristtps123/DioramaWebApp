@@ -12,6 +12,8 @@
   ── Safe wiring ──────────────────────────────────────────────────────────────
   All groups share RGB inputs: R=GPIO4, G=GPIO22, B=GPIO32
   Force sensor            : analog output=GPIO36 (VP / ADC1)
+  Intake pump driver      : control input=GPIO27
+  Drain pump driver       : control input=GPIO33
 
   ── SPI microSD adapter ─────────────────────────────────────────────────────
   SCK=GPIO18, MOSI=GPIO23, MISO=GPIO19, CS=GPIO21
@@ -27,12 +29,15 @@
 
   ── Motor Driver (ULN2003 + 28BYJ-48) ────────────────────────────────────────
   Stepper inputs: IN1=GPIO13 , IN2=GPIO14, IN3=GPIO16, IN4=GPIO17
+  Intake pump driver input: GPIO27
+  Drain pump driver input: GPIO33
 
   ── API (master calls these) ─────────────────────────────────────────────────
   GET /rgb?group=1|2|3|all&r=&g=&b=&brightness=&mode=Basic|Colorful|Sound|Adaptive&sound=0|1
   GET /off?mode=...
   GET /motor?state=on|off&dir=fwd|rev
   GET /status
+  GET /pump?type=intake|drain&state=on|off
   GET /audio/files, /audio/state, /audio/play?file=..., /audio/pause,
       /audio/next, /audio/previous
   GET /audio/stop
@@ -47,6 +52,8 @@
 #include <AudioGenerator.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioGeneratorWAV.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 #if __has_include(<AudioOutputInternalDAC.h>)
 #include <AudioOutputInternalDAC.h>
@@ -78,13 +85,19 @@ constexpr uint8_t IN2_PIN = 14;
 constexpr uint8_t IN3_PIN = 16;
 constexpr uint8_t IN4_PIN = 17;
 
+constexpr uint8_t INTAKE_PUMP_PIN = 27;
+constexpr uint8_t DRAIN_PUMP_PIN = 33;
+bool intakePumpOn = false;
+bool drainPumpOn = false;
+
 constexpr uint8_t FORCE_SENSOR_PIN = 36; // VP, ADC1 input-only pin
-constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 22050;
+constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 44100;
 constexpr uint8_t AUDIO_OUTPUT_CHANNELS = 2;
 constexpr float AUDIO_FIXED_GAIN = 1.0f;
 constexpr uint32_t AUDIO_WAV_BUFFER_BYTES = 4096;
 constexpr uint16_t AUDIO_DAC_BUFFER_BYTES = 2048;
 constexpr int AUDIO_I2S_DMA_BUFFER_COUNT = 16;
+uint32_t audioOutputSampleRateHz = AUDIO_DEFAULT_SAMPLE_RATE_HZ;
 
 constexpr uint8_t SD_SCK_PIN  = 18;
 constexpr uint8_t SD_MOSI_PIN = 23;
@@ -96,6 +109,7 @@ constexpr uint32_t SD_SPI_SAFE_FREQUENCY = 1000000;
 SPIClass sdSPI(VSPI);
 SdFs sd;
 bool sdCardReady = false;
+volatile bool audioCommandPending = false;
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 class GainAdjustedInternalDAC : public AudioOutputInternalDAC {
@@ -103,19 +117,50 @@ public:
   explicit GainAdjustedInternalDAC(uint16_t bufferSize)
       : AudioOutputInternalDAC(bufferSize) {}
 
+  bool SetRate(int rate) override {
+    if (!AudioOutputInternalDAC::SetRate(rate)) return false;
+    audioOutputSampleRateHz = rate;
+    return true;
+  }
+
+  bool begin() override {
+    return AudioOutputInternalDAC::begin() &&
+           AudioOutputInternalDAC::SetRate(audioOutputSampleRateHz);
+  }
+
   bool SetGain(float gain) override {
     outputGain = constrain(gain, 0.0f, 4.0f);
     return AudioOutputInternalDAC::SetGain(outputGain);
   }
 
   bool ConsumeSample(int16_t samples[2]) override {
-    samples[0] = static_cast<int16_t>(samples[0] * outputGain);
-    samples[1] = static_cast<int16_t>(samples[1] * outputGain);
+    if (audioCommandPending) return false;
+    for (uint8_t channel = 0; channel < AUDIO_OUTPUT_CHANNELS; ++channel) {
+      const float amplified = samples[channel] * outputGain;
+      samples[channel] = static_cast<int16_t>(
+          constrain(amplified, -32767.0f, 32767.0f));
+    }
     return AudioOutputInternalDAC::ConsumeSample(samples);
   }
 
 private:
   float outputGain = AUDIO_FIXED_GAIN;
+};
+#else
+class RateTrackingAudioOutputI2S : public AudioOutputI2S {
+public:
+  RateTrackingAudioOutputI2S(int port, int outputMode, int dmaBufferCount, int useApll)
+      : AudioOutputI2S(port, outputMode, dmaBufferCount, useApll) {}
+
+  bool SetRate(int rate) override {
+    if (!AudioOutputI2S::SetRate(rate)) return false;
+    audioOutputSampleRateHz = rate;
+    return true;
+  }
+
+  bool ConsumeSample(int16_t samples[2]) override {
+    return !audioCommandPending && AudioOutputI2S::ConsumeSample(samples);
+  }
 };
 #endif
 
@@ -188,9 +233,61 @@ uint8_t audioTrackCount = 0;
 int8_t currentAudioTrack = -1;
 int8_t pendingAudioTrack = -1;
 bool audioPlaying = false;
+bool audioOutputPaused = false;
+portMUX_TYPE audioStateMux = portMUX_INITIALIZER_UNLOCKED;
 AudioFileSourceSdFat* audioSource = nullptr;
 AudioGenerator* audioDecoder = nullptr;
 AudioOutput* audioOutput = nullptr;
+
+enum AudioCommandType : uint8_t {
+  AUDIO_COMMAND_PLAY,
+  AUDIO_COMMAND_PAUSE,
+  AUDIO_COMMAND_STEP,
+  AUDIO_COMMAND_STOP
+};
+
+struct AudioCommand {
+  AudioCommandType type;
+  int8_t value;
+};
+
+QueueHandle_t audioCommandQueue = nullptr;
+volatile bool audioTaskRunning = false;
+
+void processAudioCommand(const AudioCommand& command);
+
+void setAudioState(int8_t track, bool playing) {
+  portENTER_CRITICAL(&audioStateMux);
+  currentAudioTrack = track;
+  audioPlaying = playing;
+  portEXIT_CRITICAL(&audioStateMux);
+}
+
+void getAudioState(int8_t& track, bool& playing) {
+  portENTER_CRITICAL(&audioStateMux);
+  track = currentAudioTrack;
+  playing = audioPlaying;
+  portEXIT_CRITICAL(&audioStateMux);
+}
+
+bool queueAudioCommand(AudioCommandType type, int8_t value = 0) {
+  if (!audioCommandQueue) return false;
+  const AudioCommand command = {type, value};
+  if (xQueueSend(audioCommandQueue, &command, 0) != pdTRUE) return false;
+  audioCommandPending = true;
+  return true;
+}
+
+void serviceAudioCommands() {
+  AudioCommand command;
+  while (xQueueReceive(audioCommandQueue, &command, 0) == pdTRUE) {
+    processAudioCommand(command);
+  }
+  audioCommandPending = false;
+  if (uxQueueMessagesWaiting(audioCommandQueue) > 0) {
+    audioCommandPending = true;
+  }
+}
 
 bool innerCircleMotorRunning = false;
 bool manualMotorRunning = false;
@@ -399,13 +496,14 @@ void scanAudioTracks() {
 }
 
 void stopAudioDecoder() {
-  audioPlaying = false;
+  setAudioState(currentAudioTrack, false);
   if (audioDecoder) {
     audioDecoder->stop();
     delete audioDecoder;
     audioDecoder = nullptr;
   }
   if (audioOutput) audioOutput->stop();
+  audioOutputPaused = false;
   if (audioSource) {
     audioSource->close();
     delete audioSource;
@@ -416,7 +514,7 @@ void stopAudioDecoder() {
 bool startAudioTrack(uint8_t index) {
   if (!sdCardReady || index >= audioTrackCount) return false;
   stopAudioDecoder();
-  currentAudioTrack = -1;
+  setAudioState(-1, false);
 
   audioSource = new AudioFileSourceSdFat(audioTracks[index]);
   if (!audioSource || !audioSource->isOpen()) {
@@ -446,8 +544,8 @@ bool startAudioTrack(uint8_t index) {
     return false;
   }
 
-  currentAudioTrack = index;
-  audioPlaying = true;
+  audioOutputPaused = false;
+  setAudioState(index, true);
   Serial.printf("[AUDIO] Playing %u/%u: %s\n",
                 currentAudioTrack + 1, audioTrackCount, audioTracks[currentAudioTrack]);
   return true;
@@ -473,7 +571,7 @@ void serviceAudioPlayback() {
     const uint8_t requestedTrack = static_cast<uint8_t>(pendingAudioTrack);
     pendingAudioTrack = -1;
     if (!startAudioTrack(requestedTrack)) {
-      currentAudioTrack = -1;
+      setAudioState(-1, false);
       Serial.printf("[AUDIO] ERROR: queued track %u failed to start\n",
                     requestedTrack + 1);
     }
@@ -496,6 +594,7 @@ void serviceAudioPlayback() {
                     sd.card()->errorCode(), sd.card()->errorData());
     }
     stopAudioDecoder();
+    setAudioState(-1, false);
     return;
   }
 
@@ -503,11 +602,81 @@ void serviceAudioPlayback() {
   if (nextTrack >= 0 && nextTrack < audioTrackCount) {
     if (!startAudioTrack(static_cast<uint8_t>(nextTrack))) {
       stopAudioDecoder();
-      currentAudioTrack = -1;
+      setAudioState(-1, false);
     }
   } else {
     stopAudioDecoder();
-    currentAudioTrack = -1;
+    setAudioState(-1, false);
+  }
+}
+
+void processAudioCommand(const AudioCommand& command) {
+  switch (command.type) {
+    case AUDIO_COMMAND_PLAY: {
+      const int8_t index = command.value;
+      if (index < 0 || index >= audioTrackCount || pendingAudioTrack == index) return;
+      if (currentAudioTrack == index && audioDecoder) {
+        if (!audioOutput || !audioOutput->SetGain(AUDIO_FIXED_GAIN)) {
+          Serial.println("[AUDIO] ERROR: could not restore audio output gain");
+          return;
+        }
+        if (audioOutputPaused && !audioOutput->begin()) {
+          Serial.println("[AUDIO] ERROR: could not restart audio output for resume");
+          return;
+        }
+        audioOutputPaused = false;
+        setAudioState(currentAudioTrack, true);
+      } else {
+        pendingAudioTrack = index;
+      }
+      break;
+    }
+    case AUDIO_COMMAND_PAUSE:
+      pendingAudioTrack = -1;
+      if (!audioDecoder) {
+        Serial.println("[AUDIO] Pause ignored: no active audio track");
+        return;
+      }
+      if (!audioOutput || !audioOutput->SetGain(0.0f)) {
+        Serial.println("[AUDIO] ERROR: could not mute audio output for pause");
+        return;
+      }
+      audioOutput->flush();
+      if (!audioOutput->stop()) {
+        Serial.println("[AUDIO] ERROR: could not stop audio output for pause");
+        return;
+      }
+      audioOutputPaused = true;
+      setAudioState(currentAudioTrack, false);
+      Serial.println("[AUDIO] Playback paused; output stopped and buffer flushed");
+      break;
+    case AUDIO_COMMAND_STEP: {
+      if (!sdCardReady || !audioTrackCount) return;
+      const int8_t direction = command.value;
+      const int8_t baseTrack = pendingAudioTrack >= 0
+        ? pendingAudioTrack
+        : currentAudioTrack;
+      const uint8_t nextTrack = baseTrack >= 0
+        ? static_cast<uint8_t>((baseTrack + direction + audioTrackCount) % audioTrackCount)
+        : (direction > 0 ? 0 : audioTrackCount - 1);
+      pendingAudioTrack = static_cast<int8_t>(nextTrack);
+      break;
+    }
+    case AUDIO_COMMAND_STOP:
+      pendingAudioTrack = -1;
+      stopAudioDecoder();
+      setAudioState(-1, false);
+      Serial.println("[AUDIO] Playback stopped");
+      break;
+  }
+}
+
+void audioPlaybackTask(void*) {
+  // Keep decoder work out of the HTTP loop so controls stay responsive during playback.
+  for (;;) {
+    serviceAudioCommands();
+    serviceAudioPlayback();
+    vTaskDelay(1);
   }
 }
 
@@ -672,8 +841,11 @@ void handleAudioFiles() {
 
 void handleAudioState() {
   addCORS();
-  const char* path = currentAudioTrack >= 0
-    ? audioTracks[currentAudioTrack]
+  int8_t track;
+  bool playing;
+  getAudioState(track, playing);
+  const char* path = track >= 0
+    ? audioTracks[track]
     : "";
   String title = path;
   const int slash = title.lastIndexOf('/');
@@ -688,11 +860,42 @@ void handleAudioState() {
   json += ",\"title\":";
   json += jsonQuoted(title.c_str());
   json += ",\"playing\":";
-  json += audioPlaying ? "true" : "false";
+  json += playing ? "true" : "false";
   json += ",\"trackCount\":";
   json += String(audioTrackCount);
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void handlePump() {
+  if (!server.hasArg("type") || !server.hasArg("state") ||
+      (server.arg("type") != "intake" && server.arg("type") != "drain") ||
+      (server.arg("state") != "on" && server.arg("state") != "off")) {
+    addCORS();
+    server.send(400, "application/json",
+                "{\"error\":\"use type=intake|drain and state=on|off\"}");
+    return;
+  }
+
+  const bool enabled = server.arg("state") == "on";
+  const bool intake = server.arg("type") == "intake";
+  const uint8_t pin = intake ? INTAKE_PUMP_PIN : DRAIN_PUMP_PIN;
+  digitalWrite(pin, enabled ? HIGH : LOW);
+  if (intake) intakePumpOn = enabled;
+  else drainPumpOn = enabled;
+
+  Serial.printf("[PUMP] %s %s on GPIO %u\n",
+                intake ? "INTAKE" : "DRAIN",
+                enabled ? "ON" : "OFF",
+                static_cast<unsigned>(pin));
+  addCORS();
+  char response[96];
+  snprintf(response, sizeof(response),
+           "{\"ok\":true,\"type\":\"%s\",\"on\":%s,\"gpio\":%u}",
+           intake ? "intake" : "drain",
+           enabled ? "true" : "false",
+           static_cast<unsigned>(pin));
+  server.send(200, "application/json", response);
 }
 
 void handleAudioPlay() {
@@ -713,26 +916,13 @@ void handleAudioPlay() {
   const String requested = server.arg("file");
   for (uint8_t i = 0; i < audioTrackCount; ++i) {
     if (requested == audioTracks[i]) {
-      if (pendingAudioTrack == i) {
-        Serial.printf("[AUDIO] Play request already queued for %u/%u: %s\n",
-                      i + 1, audioTrackCount, audioTracks[i]);
-        server.send(200, "application/json", "{\"ok\":true,\"queued\":true}");
-      } else if (currentAudioTrack == i && audioDecoder) {
-        if (!audioOutput || !audioOutput->SetGain(AUDIO_FIXED_GAIN)) {
-          Serial.println("[AUDIO] ERROR: could not restore audio output gain");
-          server.send(500, "application/json", "{\"error\":\"could not resume audio output\"}");
-          return;
-        }
-        audioPlaying = true;
-        Serial.printf("[AUDIO] Resume request accepted for %u/%u: %s\n",
-                      i + 1, audioTrackCount, audioTracks[i]);
-        server.send(200, "application/json", "{\"ok\":true}");
-      } else {
-        pendingAudioTrack = static_cast<int8_t>(i);
-        Serial.printf("[AUDIO] Play/track-change request queued %u/%u: %s\n",
-                      i + 1, audioTrackCount, audioTracks[i]);
-        server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
+      if (!queueAudioCommand(AUDIO_COMMAND_PLAY, static_cast<int8_t>(i))) {
+        server.send(503, "application/json", "{\"error\":\"audio command queue is full\"}");
+        return;
       }
+      Serial.printf("[AUDIO] Play/resume queued %u/%u: %s\n",
+                    i + 1, audioTrackCount, audioTracks[i]);
+      server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
       return;
     }
   }
@@ -742,25 +932,22 @@ void handleAudioPlay() {
 
 void handleAudioPause() {
   addCORS();
+  int8_t track;
+  bool playing;
+  getAudioState(track, playing);
   Serial.printf("[MASTER CMD] PAUSE received (playing=%s, track=%d/%u)\n",
-                audioPlaying ? "yes" : "no",
-                currentAudioTrack >= 0 ? currentAudioTrack + 1 : 0,
+                playing ? "yes" : "no",
+                track >= 0 ? track + 1 : 0,
                 audioTrackCount);
-  pendingAudioTrack = -1;
-  if (!audioDecoder) {
-    Serial.println("[AUDIO] Pause ignored: no active decoder");
+  if (track < 0) {
     server.send(409, "application/json", "{\"error\":\"no active audio track\"}");
     return;
   }
-  if (!audioOutput || !audioOutput->SetGain(0.0f)) {
-    Serial.println("[AUDIO] ERROR: could not mute audio output for pause");
-    server.send(500, "application/json", "{\"error\":\"could not mute audio output\"}");
+  if (!queueAudioCommand(AUDIO_COMMAND_PAUSE)) {
+    server.send(503, "application/json", "{\"error\":\"audio command queue is full\"}");
     return;
   }
-  audioOutput->flush();
-  audioPlaying = false;
-  Serial.println("[AUDIO] Playback paused; output buffer flushed");
-  server.send(200, "application/json", "{\"ok\":true}");
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
 
 void handleAudioStep(int8_t direction) {
@@ -773,28 +960,22 @@ void handleAudioStep(int8_t direction) {
     return;
   }
 
-  const int8_t baseTrack = pendingAudioTrack >= 0
-    ? pendingAudioTrack
-    : currentAudioTrack;
-  const uint8_t nextTrack = baseTrack >= 0
-    ? static_cast<uint8_t>((baseTrack + direction + audioTrackCount) % audioTrackCount)
-    : (direction > 0 ? 0 : audioTrackCount - 1);
-  pendingAudioTrack = static_cast<int8_t>(nextTrack);
-
-  Serial.printf("[AUDIO] %s queued: track %u/%u: %s\n",
-                direction > 0 ? "NEXT" : "PREV",
-                nextTrack + 1, audioTrackCount, audioTracks[nextTrack]);
+  if (!queueAudioCommand(AUDIO_COMMAND_STEP, direction)) {
+    server.send(503, "application/json", "{\"error\":\"audio command queue is full\"}");
+    return;
+  }
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
 
 void handleAudioStop() {
   addCORS();
   Serial.println("[AUDIO] Stop request received");
-  pendingAudioTrack = -1;
-  stopAudioDecoder();
-  currentAudioTrack = -1;
-  Serial.println("[AUDIO] Playback stopped");
-  server.send(200, "application/json", "{\"ok\":true}");
+  if (!queueAudioCommand(AUDIO_COMMAND_STOP)) {
+    server.send(503, "application/json", "{\"error\":\"audio command queue is full\"}");
+    return;
+  }
+  Serial.println("[AUDIO] Stop command queued for playback task");
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
 
 void handleStatus() {
@@ -803,6 +984,7 @@ void handleStatus() {
   snprintf(buf, sizeof(buf),
     "{\"connected\":%s,\"ip\":\"%s\",\"mode\":\"%s\",\"ssid\":\"%s\","
     "\"motorRunning\":%s,\"sdCardReady\":%s,"
+    "\"intakePumpOn\":%s,\"drainagePumpOn\":%s,"
     "\"groups\":["
     "{\"id\":1,\"r\":%d,\"g\":%d,\"b\":%d,\"brightness\":%d,\"on\":%s},"
     "{\"id\":2,\"r\":%d,\"g\":%d,\"b\":%d,\"brightness\":%d,\"on\":%s},"
@@ -814,6 +996,8 @@ void handleStatus() {
     WIFI_SSID,
     innerCircleMotorRunning ? "true" : "false",
     sdCardReady ? "true" : "false",
+    intakePumpOn ? "true" : "false",
+    drainPumpOn ? "true" : "false",
     groups[0].r, groups[0].g, groups[0].b, groups[0].brightness, groups[0].on ? "true" : "false",
     groups[1].r, groups[1].g, groups[1].b, groups[1].brightness, groups[1].on ? "true" : "false",
     groups[2].r, groups[2].g, groups[2].b, groups[2].brightness, groups[2].on ? "true" : "false"
@@ -831,6 +1015,7 @@ void startHttpServer() {
   server.on("/off",    HTTP_GET,     handleOff);
   server.on("/motor",  HTTP_GET,     handleMotor);
   server.on("/force",  HTTP_GET,     handleForceSensor);
+  server.on("/pump",   HTTP_GET,     handlePump);
   server.on("/status", HTTP_GET,     handleStatus);
   server.on("/audio/files", HTTP_GET, handleAudioFiles);
   server.on("/audio/state", HTTP_GET, handleAudioState);
@@ -842,6 +1027,7 @@ void startHttpServer() {
   server.on("/rgb",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/off",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/motor",  HTTP_OPTIONS, []() { addCORS(); server.send(204); });
+  server.on("/pump",   HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/status", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/files", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/state", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
@@ -883,6 +1069,7 @@ void setup() {
   Serial.println("[SLAVE] Shared RGB pins: R=4, G=22, B=32");
   Serial.println("[AUDIO] PAM8403 analog inputs: GPIO25/26 (built-in DAC)");
   Serial.println("[SLAVE] Motor pins: IN1=13, IN2=14, IN3=16, IN4=17");
+  Serial.println("[SLAVE] Pump driver pins: intake=27, drain=33");
   Serial.println("[SD] SPI pins: SCK=18, MOSI=23, MISO=19, CS=21");
 
   // Init PWM pins OFF (inverted)
@@ -900,6 +1087,12 @@ void setup() {
   pinMode(IN4_PIN, OUTPUT);
   stopMotors();
   Serial.println("[MOTOR] ULN2003 stepper outputs ready, all OFF");
+
+  pinMode(INTAKE_PUMP_PIN, OUTPUT);
+  digitalWrite(INTAKE_PUMP_PIN, LOW);
+  pinMode(DRAIN_PUMP_PIN, OUTPUT);
+  digitalWrite(DRAIN_PUMP_PIN, LOW);
+  Serial.println("[PUMP] Intake and drain outputs ready, both OFF");
 
   pinMode(FORCE_SENSOR_PIN, INPUT);
   analogReadResolution(12);
@@ -956,7 +1149,7 @@ void setup() {
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
     audioOutput = new GainAdjustedInternalDAC(AUDIO_DAC_BUFFER_BYTES);
 #else
-    audioOutput = new AudioOutputI2S(
+    audioOutput = new RateTrackingAudioOutputI2S(
       0, AudioOutputI2S::INTERNAL_DAC, AUDIO_I2S_DMA_BUFFER_COUNT,
       AudioOutputI2S::APLL_ENABLE);
 #endif
@@ -976,12 +1169,27 @@ void setup() {
     }
   }
 
+  audioCommandQueue = xQueueCreate(8, sizeof(AudioCommand));
+  if (!audioCommandQueue) {
+    Serial.println("[AUDIO] ERROR: could not create audio command queue");
+  } else {
+    audioTaskRunning = true;
+    if (xTaskCreatePinnedToCore(
+            audioPlaybackTask, "audioPlayback", 12288, nullptr, 1, nullptr, 1) != pdPASS) {
+      audioTaskRunning = false;
+      Serial.println("[AUDIO] WARNING: playback task unavailable; using main-loop fallback");
+    }
+  }
+
   connectWifi();
 }
 
 void loop() {
   if (httpStarted) server.handleClient();
-  serviceAudioPlayback();
+  if (!audioTaskRunning && audioCommandQueue) {
+    serviceAudioCommands();
+    serviceAudioPlayback();
+  }
 
   const bool connected = (WiFi.status() == WL_CONNECTED);
   const unsigned long now = millis();

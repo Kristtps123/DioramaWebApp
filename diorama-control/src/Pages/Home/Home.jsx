@@ -72,6 +72,7 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
         fountainAuxStrength={appState.fountainAuxStrength}
         fountainForceSensorOn={appState.fountainForceSensorOn}
         fountainColor={fountainColor}
+        fountainAuxColor={appState.fountainAuxColor}
         circleColor={circleColor}
         autoDimming={autoDimming}
         audioPlaying={audioPlaying}

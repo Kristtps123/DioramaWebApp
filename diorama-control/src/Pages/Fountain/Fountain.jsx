@@ -48,6 +48,7 @@ export default function Fountain({ appState, setAppState, showToast }) {
         fountainForceSensorOn={fountainForceSensorOn}
         fountainPattern={fountainPattern}
         fountainColor={fountainColor}
+        fountainAuxColor={appState.fountainAuxColor}
         circleColor={appState.circleColor}
         autoDimming={appState.autoDimming}
         audioPlaying={appState.audioPlaying}

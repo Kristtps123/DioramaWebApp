@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import DioramaCanvas from '../../components/DioramaCanvas';
 import ColorPicker from '../../components/ColorPicker';
-import { getLiveSensors, sendColorScanMode } from '../../services/esp32Api';
+import { getLiveSensors, sendColorScanMode, triggerColorScan } from '../../services/esp32Api';
 import './Light&Color.css';
 
 const LIGHTING_MODES = [
@@ -21,7 +21,7 @@ const LIGHTING_MODES = [
   {
     id: 'Colorful',
     name: 'Custom Color',
-    desc: 'Use the color sensor or choose a color with the hue picker',
+    desc: 'Capture a color with the sensor or choose one with the hue picker',
     icon: Palette
   },
   {
@@ -60,15 +60,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
   const [colorTelemetry, setColorTelemetry] = useState({ connected: false, scanning: false, r: 255, g: 255, b: 255 });
   const [colorScanMode, setColorScanMode] = useState(true);
   const [sourceChanging, setSourceChanging] = useState(false);
-  const lightingModeRef = useRef(lightingMode);
   const colorScanModeRef = useRef(colorScanMode);
-  const setAppStateRef = useRef(setAppState);
-
-  useEffect(() => {
-    lightingModeRef.current = lightingMode;
-    colorScanModeRef.current = colorScanMode;
-    setAppStateRef.current = setAppState;
-  }, [lightingMode, colorScanMode, setAppState]);
 
   useEffect(() => {
     let active = true;
@@ -83,24 +75,6 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
             : colorScanModeRef.current;
           colorScanModeRef.current = scanMode;
           setColorScanMode(scanMode);
-          if (lightingModeRef.current === 'Colorful' && scanMode && data.colorSensor.connected) {
-            const scannedColor = rgbToHex(data.colorSensor.r, data.colorSensor.g, data.colorSensor.b);
-            setCurrentColor(scannedColor);
-            setAppStateRef.current((prev) => {
-              if (
-                prev.circleColor === scannedColor &&
-                prev.fountainColor === scannedColor &&
-                prev.fountainAuxColor === scannedColor
-              ) return prev;
-
-              return {
-                ...prev,
-                circleColor: scannedColor,
-                fountainColor: scannedColor,
-                fountainAuxColor: scannedColor
-              };
-            });
-          }
         }
       }
     };
@@ -114,6 +88,40 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
 
   const activeModeName = LIGHTING_MODES.find((mode) => mode.id === lightingMode)?.name || lightingMode;
 
+  const handleColorScan = async () => {
+    if (sourceChanging) return;
+    setSourceChanging(true);
+    try {
+      if (!colorScanModeRef.current) {
+        const updated = await sendColorScanMode(true);
+        if (!updated) {
+          showToast('Could not change the color source. Check the ESP32 connection.');
+          return;
+        }
+        colorScanModeRef.current = true;
+        setColorScanMode(true);
+      }
+
+      const result = await triggerColorScan();
+      if (!result || result.success !== true) {
+        showToast('Could not scan the color. Check that the sensor is connected and try again.');
+        return;
+      }
+
+      const scannedColor = rgbToHex(result.r, result.g, result.b);
+      setCurrentColor(scannedColor);
+      setAppState((prev) => ({
+        ...prev,
+        circleColor: scannedColor,
+        fountainColor: scannedColor,
+        fountainAuxColor: scannedColor
+      }));
+      showToast(`Color captured: ${scannedColor.toUpperCase()}`);
+    } finally {
+      setSourceChanging(false);
+    }
+  };
+
   const handleColorSourceChange = async (scanEnabled) => {
     if (sourceChanging || scanEnabled === colorScanModeRef.current) return;
     setSourceChanging(true);
@@ -126,16 +134,6 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
 
       colorScanModeRef.current = scanEnabled;
       setColorScanMode(scanEnabled);
-      if (scanEnabled && colorTelemetry.connected) {
-        const scannedColor = rgbToHex(colorTelemetry.r, colorTelemetry.g, colorTelemetry.b);
-        setCurrentColor(scannedColor);
-        setAppState((prev) => ({
-          ...prev,
-          circleColor: scannedColor,
-          fountainColor: scannedColor,
-          fountainAuxColor: scannedColor
-        }));
-      }
     } finally {
       setSourceChanging(false);
     }
@@ -179,7 +177,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
       <div className="page-header-text">
         <div className="section-breadcrumb">CONTROLS / 01</div>
         <h1 className="page-main-title">Lights & Colors</h1>
-        <p className="page-subtitle">Set the mood and color of your little world.</p>
+        <p className="page-subtitle">Set the mood and color of your diorama.</p>
       </div>
 
       {/* 3D Diorama Preview */}
@@ -291,15 +289,13 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
                     <h3 className="card-title">Color Control</h3>
                     <span
                       className="color-mini-swatch"
-                      style={{ backgroundColor: colorScanMode && colorTelemetry.connected
-                        ? rgbToHex(colorTelemetry.r, colorTelemetry.g, colorTelemetry.b)
-                        : currentColor }}
+                      style={{ backgroundColor: currentColor }}
                       title={currentColor}
                     />
                     <span className="hex-mini-tag">{(currentColor || '').toUpperCase()}</span>
                   </div>
                   <span className="card-status-subtext">
-                    Select automatic color scanning or use the hue picker.
+                    Capture a color once with the sensor or use the hue picker.
                   </span>
                 </div>
               </div>
@@ -312,9 +308,9 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
                   className={`color-source-option ${colorScanMode ? 'active' : ''}`}
                   aria-pressed={colorScanMode}
                   disabled={sourceChanging}
-                  onClick={() => handleColorSourceChange(true)}
+                  onClick={handleColorScan}
                 >
-                  Color Scan
+                  Scan Color
                 </button>
                 <button
                   type="button"
@@ -330,22 +326,20 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
               <div className="detected-color-row">
                 <span className="detected-color-status">
                   <span
-                    className="color-mini-swatch"
-                    style={{ backgroundColor: colorScanMode && colorTelemetry.connected
-                      ? rgbToHex(colorTelemetry.r, colorTelemetry.g, colorTelemetry.b)
-                      : currentColor }}
+                  className="color-mini-swatch"
+                  style={{ backgroundColor: currentColor }}
                   />
                   {colorScanMode
-                    ? colorTelemetry.connected
-                      ? `Scanning ${rgbToHex(colorTelemetry.r, colorTelemetry.g, colorTelemetry.b).toUpperCase()}`
-                      : 'Waiting for color sensor reading…'
-                    : `Picker color ${currentColor.toUpperCase()} — applied to all zones`}
+                  ? colorTelemetry.connected
+                    ? `Sensor ready — held color ${currentColor.toUpperCase()}`
+                    : 'Waiting for color sensor reading…'
+                  : `Picker color ${currentColor.toUpperCase()} — applied to all zones`}
                 </span>
                 <span className="hex-display">{(currentColor || '').toUpperCase()}</span>
               </div>
               {colorScanMode
                 ? <p className="card-description-subtext mt-1">
-                    The latest sensor color is held and applied to all three zones until the next reading.
+                    Press Scan Color to capture the object. The lights keep that color until you scan again.
                   </p>
                 : <ColorPicker rgb={hexToRgb(currentColor)} onChange={handlePickerChange} />}
             </div>

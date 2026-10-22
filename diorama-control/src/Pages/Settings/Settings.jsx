@@ -241,7 +241,7 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
         </div>
       </div>
 
-      {/* Drainage pump control */}
+      {/* Intake and drainage pump controls */}
       <div className="settings-single-grid mt-4">
         <div className="control-card">
           <div className="card-header">
@@ -250,8 +250,37 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
                 <Droplets size={22} />
               </div>
               <div>
+                <h3 className="card-title">Water Intake Pump</h3>
+                <p className="card-subtitle">Fills the tank · Slave GPIO 27</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              className={`drainage-pump-toggle ${appState.intakePumpOn ? 'is-on' : ''}`}
+              aria-pressed={appState.intakePumpOn}
+              onClick={() => setAppState({ intakePumpOn: !appState.intakePumpOn })}
+            >
+              {appState.intakePumpOn ? 'Turn OFF' : 'Turn ON'}
+            </button>
+          </div>
+          <p className="card-description-subtext">
+            Switches the intake pump driver input on the slave ESP32. Connect the pump through a suitable
+            motor driver or relay module; do not power the pump from GPIO 27.
+          </p>
+          <div className={`drainage-pump-status ${appState.intakePumpOn ? 'is-on' : ''}`} role="status">
+            Intake pump · Slave GPIO 27: {appState.intakePumpOn ? 'ON' : 'OFF'}
+          </div>
+        </div>
+
+        <div className="control-card">
+          <div className="card-header">
+            <div className="card-title-group">
+              <div className="icon-badge sage">
+                <Droplets size={22} />
+              </div>
+              <div>
                 <h3 className="card-title">Water Drainage Pump</h3>
-                <p className="card-subtitle">Third pump · suction/drainage</p>
+                <p className="card-subtitle">Suction/drainage · Slave GPIO 33</p>
               </div>
             </div>
             <button
@@ -264,11 +293,11 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
             </button>
           </div>
           <p className="card-description-subtext">
-            This pump is intended to suck water out of the tank. Its ON/OFF request is shown here, but the
-            physical output is not active until the pump GPIO pin and wiring are provided and configured.
+            Switches the drainage pump driver input on the slave ESP32. Use a suitable motor driver or relay;
+            do not power the pump directly from GPIO 33.
           </p>
           <div className={`drainage-pump-status ${appState.drainagePumpOn ? 'is-on' : ''}`} role="status">
-            Drainage pump request: {appState.drainagePumpOn ? 'ON' : 'OFF'} · hardware pin pending
+            Drainage pump · Slave GPIO 33: {appState.drainagePumpOn ? 'ON' : 'OFF'}
           </div>
         </div>
       </div>

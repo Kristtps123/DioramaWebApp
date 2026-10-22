@@ -1,0 +1,19 @@
+THE STORY OF MY DIORAMA
+
+[Begin recording]
+
+This is the story of my diorama, a miniature recreation inspired by Silvestre del Moro Park in Sta. Elena, Camarines Norte, Philippines.
+
+I created this project to bring a familiar local landmark to life in miniature. The park is known as a place for the community to gather, and its fountain, walkways, greenery, and welcoming entrance are among the details that inspired the model.
+
+The diorama is more than a static display. Its lighting can be adjusted and changed between different colors and effects. The fountain uses pumps to create moving water, and a force sensor can be used to influence the water system. The inner plaza can rotate, adding movement to the scene.
+
+Sound is also part of the experience. A microphone can make the lighting or movement respond to sound, while recorded audio can be played through the diorama. Sensors and electronics help connect these features, with ESP32 controllers coordinating the system.
+
+To make the diorama easier to use, I developed both an onboard control interface and a web application. Together, they provide ways to manage the lights, fountain, audio, and other functions. The project also includes a fingerprint-controlled gate feature, adding an interactive welcome to the miniature park.
+
+Building this diorama brought together model-making, electronics, programming, and a connection to a place in my community. Each feature helps turn the model into an interactive representation of Silvestre del Moro Park.
+
+This recording preserves the purpose and design of the project: to remember a local landmark and share its character through a working miniature.
+
+[End recording]

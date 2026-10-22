@@ -144,7 +144,7 @@ export default function Audio({ appState, setAppState, showToast }) {
       <div className="page-header-text">
         <div className="section-breadcrumb audio-breadcrumb">LIBRARY / AUDIO</div>
         <h1 className="page-main-title">Audio</h1>
-        <p className="page-subtitle">Bring a soundtrack to your little world.</p>
+        <p className="page-subtitle">Bring a soundtrack to your diorama.</p>
       </div>
 
       {/* SD-Card Tracks Section */}

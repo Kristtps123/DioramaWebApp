@@ -1,4 +1,4 @@
-/*
+﻿/*
   Silvestre del Moro Park — Diorama Controller v4
   ESP32 + ILI9488 480×320 + XPT2046 touch + rotary encoder + WiFi HTTP server
 
@@ -22,8 +22,10 @@
                                           LV=3.3V(ESP32), LV1=GPIO34(D34), LV-GND=ESP32 GND
                          BOTH GND pins on the level converter must be connected!
   Color UART packet, one line at 9600 baud: JSON RGB or three RGB numbers
-  Fountain pumps: TB6612FNG PWMA/PWMB <- GPIO 13 (shared PWM speed);
+  Fountain pumps: TB6612FNG PWMA/PWMB <- main ESP32 GPIO 13 (shared PWM speed);
                   AIN1/BIN1 -> 3.3V, AIN2/BIN2 -> GND, STBY -> 3.3V
+  Intake pump   : slave ESP32 GPIO 27 through a suitable motor driver.
+  Drain pump    : slave ESP32 GPIO 33 through a suitable motor driver.
   Fingerprint : RX2=16 ← sensor TX,  TX2=17 → sensor RX  (UART2)
   Gate servo   : signal GPIO 22; power from a suitable external supply,
                  with the servo ground connected to ESP32 GND
@@ -35,6 +37,7 @@
                                                (all RGB zones share one color)
   GET /api/color/source?mode=scan|picker
   GET /api/fountain?state=on|off&strength=0-100&auxStrength=0-100
+  GET /api/intake-pump?state=on|off
   GET /api/force-sensor?state=on|off
   GET /api/force                                → {"active":bool,"level":0-1023}
   GET /api/drainage-pump?state=on|off
@@ -240,14 +243,15 @@ int     hue = 36, sat = 46;
 bool    colorScanMode = true;
 
 // Fountain
-constexpr int MAX_FOUNTAIN_PWM = 100;
+constexpr int MAX_FOUNTAIN_PWM = 150;
 bool    fountainOn  = false;
 int     fountainStr = 100;  // 0-100
 int     fountainAux = 100;  // Mirrors shared speed for compatibility with the UI state.
 bool    forceSensorOn = false;
 int     manualFountainStr = 100;
 int     forceSensorLevel = 0; // Nonlinear sensor level normalized to 0-1023 for the web UI.
-bool    drainagePumpOn = false; // Software state only until a hardware pin is assigned.
+bool    intakePumpOn = false;
+bool    drainagePumpOn = false;
 
 int fountainPumpDuty() {
   return fountainOn ? fountainStr * MAX_FOUNTAIN_PWM / 100 : 0;
@@ -276,6 +280,13 @@ uint32_t trackStartMs = 0;
 bool     slaveAudioReachable = false;
 uint32_t lastSlaveAudioSyncMs = 0;
 uint32_t lastSlaveAudioListMs = 0;
+bool     autoDefaultAudioAttempted = false;
+bool     autoAudioResumeAfterSound = false;
+bool     soundPauseAttempted = false;
+bool     soundResumeAttempted = false;
+uint32_t lastAutoAudioAttemptMs = 0;
+uint32_t lastSoundPauseAttemptMs = 0;
+uint32_t lastSoundResumeAttemptMs = 0;
 
 // TFT page / mode
 Page  page      = P_LIGHTS;
@@ -315,7 +326,6 @@ bool ambientSensorConfigured = false;
 float ambientLux = 0.0f;
 RGB detectedColor = {255, 255, 255};
 uint32_t colorSensorLastPacketMs = 0;
-uint32_t lastColorAutoApplyMs = 0;
 uint32_t ambientLastDrawMs = 0;
 
 bool wasTouched = false;
@@ -345,7 +355,7 @@ void IRAM_ATTR encoderQuadratureISR();
 void startEnrollment();
 bool deleteUser(int fpID);
 void togglePlay();
-bool stepTrack(int direction);
+bool stepTrack(int direction, String* response = nullptr, int* statusCode = nullptr);
 bool sendSlaveAudioCommand(const String& endpoint);
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -618,12 +628,11 @@ void updateColorSensorScanForMode() {
       colorSensorScanning = true;
       colorSensorReceiveSeen = false;
       colorSensorLastPacketMs = millis();
-      Serial.println("[COLOR UART] Scan started automatically in Custom Color mode");
-      if (colorSensorAvailable) applyScannedColor();
+      Serial.println("[COLOR UART] Color scan source selected; waiting for a manual capture");
     }
   } else if (colorSensorScanning) {
     colorSensorScanning = false;
-    Serial.println("[COLOR UART] Automatic color application stopped");
+    Serial.println("[COLOR UART] Color scan source disabled");
   }
 }
 
@@ -653,7 +662,7 @@ void rgbToHsvValues(uint8_t r, uint8_t g, uint8_t b, int* h, int* s) {
 }
 
 void applyScannedColor() {
-  // Scanned colors only apply when automatic color scan is selected.
+  // A captured color is held until the user requests another scan.
   if (lightMode != "Colorful" || !colorScanMode) {
     Serial.printf("[COLOR SCAN] Ignored (mode=%s scanMode=%s)\n",
                   lightMode.c_str(), colorScanMode ? "scan" : "picker");
@@ -672,6 +681,20 @@ void applyScannedColor() {
   }
   Serial.printf("[COLOR SCAN] Captured & Applied RGB=%u,%u,%u (#%02X%02X%02X)\n",
                 cur.r, cur.g, cur.b, cur.r, cur.g, cur.b);
+}
+
+bool captureColorSensorColor() {
+  if (!colorSensorAvailable) {
+    Serial.println("[COLOR SCAN] Capture failed: no recent sensor reading");
+    return false;
+  }
+  if (lightMode != "Colorful" || !colorScanMode) {
+    Serial.printf("[COLOR SCAN] Capture ignored (mode=%s scanMode=%s)\n",
+                  lightMode.c_str(), colorScanMode ? "scan" : "picker");
+    return false;
+  }
+  applyScannedColor();
+  return true;
 }
 
 void processColorSensorColor(const RGB& raw) {
@@ -699,13 +722,7 @@ void processColorSensorColor(const RGB& raw) {
                   detectedColor.r, detectedColor.g, detectedColor.b);
   }
 
-  // Limit network updates while keeping the automatic color response live.
-  const uint32_t now = millis();
-  if (lightMode == "Colorful" && colorScanMode &&
-      (lastColorAutoApplyMs == 0 || now - lastColorAutoApplyMs >= 250)) {
-    lastColorAutoApplyMs = now;
-    applyScannedColor();
-  } else if (!wasAvailable && page == P_LIGHTS && tftMode == M_COLOR) {
+  if (!wasAvailable && page == P_LIGHTS && tftMode == M_COLOR) {
     drawColorPanel();
   }
 }
@@ -815,7 +832,7 @@ void updateColorSensor() {
   }
 }
 
-// Ambient sensing stays local on I2C; color UART packets are accepted during scans.
+// Ambient sensing stays local on I2C; color UART readings are received continuously.
 constexpr uint8_t VEML7700_ADDR = 0x10;
 constexpr uint8_t VEML7700_ALS_CONF = 0x00;
 constexpr uint8_t VEML7700_ALS_DATA = 0x04;
@@ -1380,6 +1397,10 @@ void enterGateState(GateState s) {
     }
     audioPlaying = false;
     audioStarted = false;
+    autoDefaultAudioAttempted = false;
+    autoAudioResumeAfterSound = false;
+    soundPauseAttempted = false;
+    soundResumeAttempted = false;
   }
 
   gateState = s;
@@ -1558,10 +1579,10 @@ void drawColorPanel() {
   tft.fillRect(0, py, W, H - py, C_BG);
 
   label("Color source:", SL_X0, py + 2);
-  btn(330, py, 140, 24, colorScanMode ? "COLOR SCAN" : "HUE PICKER",
-      !colorScanMode, C_AMBER, 1);
-  drawFocusCue(330, py, 140, 24, 7, false);
-  drawEncoderFocusCue(330, py, 140, 24,
+  btn(190, py, 130, 24, "SCAN COLOR", colorScanMode, C_AMBER, 1);
+  btn(330, py, 140, 24, "HUE PICKER", !colorScanMode, C_AMBER, 1);
+  drawFocusCue(190, py, 130, 24, 7, false);
+  drawEncoderFocusCue(190, py, 130, 24,
                       encoderControl == ENC_CONTROL_COLOR_SOURCE);
 
   tft.fillRoundRect(10, py + 27, 28, 18, 4, c565(cur));
@@ -1570,7 +1591,7 @@ void drawColorPanel() {
   txt(hex, 44, py + 31, 2, C_TEXT, C_BG, TL_DATUM);
 
   if (colorScanMode) {
-    label(colorSensorAvailable ? "Latest sensor color applied to all zones"
+    label(colorSensorAvailable ? "Captured color held; press Scan Color to update"
                                : "Waiting for color sensor reading...",
           SL_X0, py + 66);
     return;
@@ -1889,6 +1910,7 @@ void activateEncoderControl() {
     case ENC_CONTROL_COLOR_SOURCE:
       colorScanMode = !colorScanMode;
       updateColorSensorScanForMode();
+      if (colorScanMode) captureColorSensorColor();
       drawColorPanel();
       syncEncoderControlIndex();
       break;
@@ -2521,6 +2543,7 @@ bool startTrack(int i) {
   if (sendSlaveAudioCommand(endpoint)) {
     curTrack = i;
     audioPlaying = audioStarted = true;
+    autoDefaultAudioAttempted = true;
     trackStartMs = millis();
     Serial.printf("[AUDIO] Playing %d/%d: %s\n", curTrack + 1, trackCount, trackPath[i]);
     return true;
@@ -2528,16 +2551,20 @@ bool startTrack(int i) {
   return false;
 }
 
-bool stepTrack(int direction) {
+bool stepTrack(int direction, String* response, int* statusCode) {
   if (!trackCount) return false;
   const int next = audioStarted
     ? (curTrack + direction + trackCount) % trackCount
     : (direction > 0 ? 0 : trackCount - 1);
   const char* endpoint = direction > 0 ? "/audio/next" : "/audio/previous";
-  if (!sendSlaveAudioCommand(endpoint)) return false;
+  const bool commandAccepted = response && statusCode
+    ? requestSlaveAudio(endpoint, *response, *statusCode)
+    : sendSlaveAudioCommand(endpoint);
+  if (!commandAccepted) return false;
 
   curTrack = next;
   audioPlaying = audioStarted = true;
+  autoDefaultAudioAttempted = true;
   trackStartMs = millis();
   Serial.printf("[AUDIO] Stepped to %d/%d: %s\n",
                 curTrack + 1, trackCount, trackPath[curTrack]);
@@ -2552,6 +2579,55 @@ void togglePlay() {
     const int selected = audioStarted ? curTrack : 0;
     startTrack(selected);
   }
+}
+
+void updateAutomaticAudio() {
+  if (!gateOpen) return;
+
+  if (lightMode == "Sound Reactive") {
+    if (audioPlaying &&
+        (!soundPauseAttempted || millis() - lastSoundPauseAttemptMs >= 3000)) {
+      lastSoundPauseAttemptMs = millis();
+      soundPauseAttempted = true;
+      if (sendSlaveAudioCommand("/audio/pause")) {
+        audioPlaying = false;
+        autoAudioResumeAfterSound = true;
+      }
+    }
+    return;
+  }
+  soundPauseAttempted = false;
+
+  if (autoAudioResumeAfterSound) {
+    if (soundResumeAttempted && millis() - lastSoundResumeAttemptMs < 3000) return;
+    lastSoundResumeAttemptMs = millis();
+    soundResumeAttempted = true;
+    if (curTrack >= 0 && curTrack < trackCount && startTrack(curTrack)) {
+      autoAudioResumeAfterSound = false;
+      soundResumeAttempted = false;
+    }
+    return;
+  }
+  soundResumeAttempted = false;
+
+  if (autoDefaultAudioAttempted || audioStarted || !slaveAudioReachable || !sdOk) return;
+  if (millis() - lastAutoAudioAttemptMs < 3000) return;
+  lastAutoAudioAttemptMs = millis();
+
+  for (int i = 0; i < trackCount; ++i) {
+    const char* filename = strrchr(trackPath[i], '/');
+    filename = filename ? filename + 1 : trackPath[i];
+    const String name(filename);
+    if (name.equalsIgnoreCase("track01.mp3") || name.equalsIgnoreCase("track01.wav")) {
+      if (startTrack(i)) {
+        autoDefaultAudioAttempted = true;
+      }
+      return;
+    }
+  }
+
+  Serial.println("[AUDIO] Default track track01.mp3/track01.wav was not found");
+  autoDefaultAudioAttempted = true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2627,15 +2703,21 @@ void onPress(int x, int y) {
 
     // Drain ON button
     if (inRect(x, y, 300, dy + 8, 64, 32)) {
-      drainagePumpOn = true;
-      Serial.println("[DRAIN] ON (software only — no GPIO configured yet)");
+      if (sendSlaveAudioCommand("/pump?type=drain&state=on")) {
+        drainagePumpOn = true;
+      } else {
+        Serial.println("[DRAIN] ERROR: slave pump command failed");
+      }
       drawSettings();
       return;
     }
     // Drain OFF button
     if (inRect(x, y, 374, dy + 8, 64, 32)) {
-      drainagePumpOn = false;
-      Serial.println("[DRAIN] OFF");
+      if (sendSlaveAudioCommand("/pump?type=drain&state=off")) {
+        drainagePumpOn = false;
+      } else {
+        Serial.println("[DRAIN] ERROR: slave pump command failed");
+      }
       drawSettings();
       return;
     }
@@ -2729,12 +2811,21 @@ void onPress(int x, int y) {
       dragging = D_BR; onDrag(x); return;
     }
 
-    // Custom Color mode is controlled automatically by the color sensor.
+    // Custom Color is set by a one-shot sensor capture or the hue picker.
     if (tftMode == M_COLOR) {
       const int py = BODY_Y + 170;
+      if (inRect(x, y, 190, py, 130, 24)) {
+        selectEncoderControl(ENC_CONTROL_COLOR_SOURCE);
+        colorScanMode = true;
+        updateColorSensorScanForMode();
+        captureColorSensorColor();
+        drawColorPanel();
+        syncEncoderControlIndex();
+        return;
+      }
       if (inRect(x, y, 330, py, 140, 24)) {
         selectEncoderControl(ENC_CONTROL_COLOR_SOURCE);
-        colorScanMode = !colorScanMode;
+        colorScanMode = false;
         updateColorSensorScanForMode();
         drawColorPanel();
         syncEncoderControlIndex();
@@ -3025,7 +3116,16 @@ void handleColorSource() {
 void handleColorScan() {
   colorScanMode = true;
   updateColorSensorScanForMode();
-  if (colorSensorAvailable) applyScannedColor();
+  if (lightMode != "Colorful") {
+    server.send(409, "application/json",
+                "{\"error\":\"switch to Custom Color mode before scanning\"}");
+    return;
+  }
+  if (!captureColorSensorColor()) {
+    server.send(503, "application/json",
+                "{\"error\":\"color sensor has no recent reading\"}");
+    return;
+  }
   if (page == P_LIGHTS && tftMode == M_COLOR) drawColorPanel();
   char buf[128];
   snprintf(buf, sizeof(buf),
@@ -3159,8 +3259,34 @@ void handleForceSensorLevel() {
   server.send(200, "application/json", response);
 }
 
+// ── GET /api/intake-pump?state=on|off ────────────────────────────────────────
+void handleIntakePump() {
+  if (!server.hasArg("state") ||
+      (server.arg("state") != "on" && server.arg("state") != "off")) {
+    server.send(400, "application/json",
+                "{\"error\":\"missing or invalid state; use state=on or state=off\"}");
+    return;
+  }
+
+  const bool requestedState = server.arg("state") == "on";
+  const String endpoint = String("/pump?type=intake&state=") +
+                          (requestedState ? "on" : "off");
+  if (!sendSlaveAudioCommand(endpoint)) {
+    server.send(503, "application/json",
+                "{\"error\":\"slave ESP32 unavailable; intake pump command failed\"}");
+    return;
+  }
+
+  intakePumpOn = requestedState;
+  Serial.printf("[INTAKE PUMP] %s on slave GPIO 27\n",
+                intakePumpOn ? "ON" : "OFF");
+  server.send(200, "application/json",
+              intakePumpOn
+                ? "{\"ok\":true,\"on\":true,\"gpio\":27,\"board\":\"slave\"}"
+                : "{\"ok\":true,\"on\":false,\"gpio\":27,\"board\":\"slave\"}");
+}
+
 // ── GET /api/drainage-pump?state=on|off ──────────────────────────────────────
-// The GPIO is intentionally not configured until the user supplies the pump pin.
 void handleDrainagePump() {
   if (!server.hasArg("state") ||
       (server.arg("state") != "on" && server.arg("state") != "off")) {
@@ -3169,15 +3295,22 @@ void handleDrainagePump() {
     return;
   }
 
-  drainagePumpOn = server.arg("state") == "on";
-  Serial.printf("[DRAINAGE PUMP] Requested %s; output not energized because no GPIO pin is configured\n",
-                drainagePumpOn ? "ON" : "OFF");
+  const bool requestedState = server.arg("state") == "on";
+  const String endpoint = String("/pump?type=drain&state=") +
+                          (requestedState ? "on" : "off");
+  if (!sendSlaveAudioCommand(endpoint)) {
+    server.send(503, "application/json",
+                "{\"error\":\"slave ESP32 unavailable; drainage pump command failed\"}");
+    return;
+  }
 
-  char response[128];
-  snprintf(response, sizeof(response),
-           "{\"ok\":true,\"requested\":%s,\"hardwareConfigured\":false}",
-           drainagePumpOn ? "true" : "false");
-  server.send(200, "application/json", response);
+  drainagePumpOn = requestedState;
+  Serial.printf("[DRAINAGE PUMP] %s on slave GPIO 33\n",
+                drainagePumpOn ? "ON" : "OFF");
+  server.send(200, "application/json",
+              drainagePumpOn
+                ? "{\"ok\":true,\"requested\":true,\"hardwareConfigured\":true,\"gpio\":33,\"board\":\"slave\"}"
+                : "{\"ok\":true,\"requested\":false,\"hardwareConfigured\":true,\"gpio\":33,\"board\":\"slave\"}");
 }
 
 // ── GET /api/gate?state=open|closed ─────────────────────────────────────────
@@ -3265,13 +3398,15 @@ void handleAudioStep(int direction) {
                 "{\"error\":\"slave SD/audio playlist unavailable\"}");
     return;
   }
-  if (!stepTrack(direction)) {
-    server.send(503, "application/json",
-                "{\"error\":\"slave rejected audio track change\"}");
+  String response;
+  int statusCode = 0;
+  if (!stepTrack(direction, &response, &statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave rejected audio track change\"}");
     return;
   }
   if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
-  server.send(200, "application/json", "{\"ok\":true}");
+  server.send(statusCode, "application/json", response);
 }
 
 // ── GET /api/audio/stop ──────────────────────────────────────────────────────
@@ -3285,6 +3420,10 @@ void handleAudioStop() {
     return;
   }
   audioPlaying = audioStarted = false;
+  autoDefaultAudioAttempted = true;
+  autoAudioResumeAfterSound = false;
+  soundPauseAttempted = false;
+  soundResumeAttempted = false;
   if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
   server.send(statusCode, "application/json", response);
 }
@@ -3383,6 +3522,7 @@ void handleState() {
     "\"fountainStr\":%d,"
     "\"fountainAux\":%d,"
     "\"fountainForceSensorOn\":%s,"
+    "\"intakePumpOn\":%s,"
     "\"drainagePumpOn\":%s,"
     "\"audioPlaying\":%s,"
     "\"audioTrack\":\"%s\","
@@ -3401,6 +3541,7 @@ void handleState() {
     fountainStr,
     fountainAux,
     forceSensorOn  ? "true" : "false",
+    intakePumpOn   ? "true" : "false",
     drainagePumpOn ? "true" : "false",
     audioPlaying   ? "true" : "false",
     trackName,
@@ -3603,6 +3744,7 @@ void setupRoutes() {
   server.on("/api/fountain",         HTTP_OPTIONS, handleOptions);
   server.on("/api/force-sensor",     HTTP_OPTIONS, handleOptions);
   server.on("/api/force",            HTTP_OPTIONS, handleOptions);
+  server.on("/api/intake-pump",      HTTP_OPTIONS, handleOptions);
   server.on("/api/drainage-pump",   HTTP_OPTIONS, handleOptions);
   server.on("/api/gate",             HTTP_OPTIONS, handleOptions);
   server.on("/api/gate/status",      HTTP_OPTIONS, handleOptions);
@@ -3630,6 +3772,7 @@ void setupRoutes() {
   server.on("/api/fountain",HTTP_GET,[]() { addCORSHeaders(); handleFountain();     });
   server.on("/api/force-sensor", HTTP_GET, []() { addCORSHeaders(); handleForceSensorControl(); });
   server.on("/api/force", HTTP_GET, []() { addCORSHeaders(); handleForceSensorLevel(); });
+  server.on("/api/intake-pump", HTTP_GET, []() { addCORSHeaders(); handleIntakePump(); });
   server.on("/api/drainage-pump",HTTP_GET,[]() { addCORSHeaders(); handleDrainagePump(); });
   server.on("/api/gate",   HTTP_GET, []() { addCORSHeaders(); handleGate();         });
   server.on("/api/gate/status", HTTP_GET, []() { addCORSHeaders(); handleGateStatus(); });
@@ -3981,6 +4124,7 @@ void loop() {
     updateLive();
   }
   syncSlaveAudioState();
+  updateAutomaticAudio();
   
   // Enrollment polling
   pollEnrollment();
