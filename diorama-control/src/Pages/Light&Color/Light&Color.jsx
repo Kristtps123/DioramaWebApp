@@ -4,7 +4,8 @@ import {
   Mic,
   Palette,
   Sun,
-  Check
+  Check,
+  ScanLine
 } from 'lucide-react';
 import DioramaCanvas from '../../components/DioramaCanvas';
 import ColorPicker from '../../components/ColorPicker';
@@ -61,6 +62,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
   const [colorScanMode, setColorScanMode] = useState(true);
   const [sourceChanging, setSourceChanging] = useState(false);
   const colorScanModeRef = useRef(colorScanMode);
+  const sourceChangingRef = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -70,11 +72,13 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
         if (data.ambientLight) setAmbientTelemetry(data.ambientLight);
         if (data.colorSensor) {
           setColorTelemetry(data.colorSensor);
-          const scanMode = data.colorSensor.scanMode
-            ? data.colorSensor.scanMode === 'scan'
-            : colorScanModeRef.current;
-          colorScanModeRef.current = scanMode;
-          setColorScanMode(scanMode);
+          if (!sourceChangingRef.current) {
+            const scanMode = data.colorSensor.scanMode
+              ? data.colorSensor.scanMode === 'scan'
+              : colorScanModeRef.current;
+            colorScanModeRef.current = scanMode;
+            setColorScanMode(scanMode);
+          }
         }
       }
     };
@@ -88,9 +92,12 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
 
   const activeModeName = LIGHTING_MODES.find((mode) => mode.id === lightingMode)?.name || lightingMode;
 
-  const handleColorScan = async () => {
+  const handleColorScan = async (restorePicker = false) => {
     if (sourceChanging) return;
+    const shouldRestorePicker = restorePicker && !colorScanModeRef.current;
+    let scanModeEnabled = colorScanModeRef.current;
     setSourceChanging(true);
+    sourceChangingRef.current = true;
     try {
       if (!colorScanModeRef.current) {
         const updated = await sendColorScanMode(true);
@@ -98,8 +105,11 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
           showToast('Could not change the color source. Check the ESP32 connection.');
           return;
         }
-        colorScanModeRef.current = true;
-        setColorScanMode(true);
+        scanModeEnabled = true;
+        if (!shouldRestorePicker) {
+          colorScanModeRef.current = true;
+          setColorScanMode(true);
+        }
       }
 
       const result = await triggerColorScan();
@@ -118,6 +128,13 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
       }));
       showToast(`Color captured: ${scannedColor.toUpperCase()}`);
     } finally {
+      if (shouldRestorePicker && scanModeEnabled) {
+        const restored = await sendColorScanMode(false);
+        colorScanModeRef.current = !restored;
+        setColorScanMode(!restored);
+        if (!restored) showToast('Color was scanned, but the picker source could not be restored.');
+      }
+      sourceChangingRef.current = false;
       setSourceChanging(false);
     }
   };
@@ -125,6 +142,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
   const handleColorSourceChange = async (scanEnabled) => {
     if (sourceChanging || scanEnabled === colorScanModeRef.current) return;
     setSourceChanging(true);
+    sourceChangingRef.current = true;
     try {
       const updated = await sendColorScanMode(scanEnabled);
       if (!updated) {
@@ -135,6 +153,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
       colorScanModeRef.current = scanEnabled;
       setColorScanMode(scanEnabled);
     } finally {
+      sourceChangingRef.current = false;
       setSourceChanging(false);
     }
   };
@@ -308,9 +327,9 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
                   className={`color-source-option ${colorScanMode ? 'active' : ''}`}
                   aria-pressed={colorScanMode}
                   disabled={sourceChanging}
-                  onClick={handleColorScan}
+                  onClick={() => handleColorSourceChange(true)}
                 >
-                  Scan Color
+                  Color Sensor
                 </button>
                 <button
                   type="button"
@@ -338,10 +357,24 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
                 <span className="hex-display">{(currentColor || '').toUpperCase()}</span>
               </div>
               {colorScanMode
-                ? <p className="card-description-subtext mt-1">
-                    Press Scan Color to capture the object. The lights keep that color until you scan again.
-                  </p>
-                : <ColorPicker rgb={hexToRgb(currentColor)} onChange={handlePickerChange} />}
+                ? <div className="color-scan-panel">
+                    <p className="card-description-subtext mt-1">
+                      Scan an object to capture its color. The lights keep that color until the next scan.
+                    </p>
+                    <button
+                      type="button"
+                      className="cpk-scan-button"
+                      onClick={() => handleColorScan()}
+                      disabled={sourceChanging}
+                    >
+                      <ScanLine size={16} />
+                      {sourceChanging ? 'Scanning...' : 'Scan Color'}
+                    </button>
+                  </div>
+                : <ColorPicker
+                    rgb={hexToRgb(currentColor)}
+                    onChange={handlePickerChange}
+                  />}
             </div>
           </div>
         )}

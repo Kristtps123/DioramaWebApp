@@ -63,10 +63,12 @@ enum GateState { GS_WAITING = 0, GS_SCANNING = 1, GS_WELCOME = 2, GS_OPEN = 3, G
 enum EncoderMode { ENC_NAVIGATE, ENC_FOCUS, ENC_ADJUST };
 enum EncoderControl {
   ENC_CONTROL_NONE,
+  ENC_CONTROL_EXIT,
   ENC_CONTROL_LIGHT_MODE,
   ENC_CONTROL_LIGHT_POWER,
   ENC_CONTROL_BRIGHTNESS,
   ENC_CONTROL_COLOR_SOURCE,
+  ENC_CONTROL_COLOR_SCAN,
   ENC_CONTROL_HUE,
   ENC_CONTROL_SATURATION,
   ENC_CONTROL_SENSITIVITY,
@@ -74,6 +76,10 @@ enum EncoderControl {
   ENC_CONTROL_AUDIO_PLAY,
   ENC_CONTROL_AUDIO_NEXT,
   ENC_CONTROL_SETTINGS_ENROLL,
+  ENC_CONTROL_SETTINGS_DRAIN_ON,
+  ENC_CONTROL_SETTINGS_DRAIN_OFF,
+  ENC_CONTROL_SETTINGS_INTAKE_ON,
+  ENC_CONTROL_SETTINGS_INTAKE_OFF,
   ENC_CONTROL_SETTINGS_DELETE_0,
   ENC_CONTROL_SETTINGS_DELETE_1,
   ENC_CONTROL_SETTINGS_DELETE_2,
@@ -95,6 +101,7 @@ struct FingerprintUser {
 #include <SPI.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
@@ -164,6 +171,7 @@ void runInnerCircle(bool = true) {
 
 // ── Objects ───────────────────────────────────────────────────────────────────
 TFT_eSPI   tft = TFT_eSPI();
+DNSServer  captiveDnsServer;
 WebServer  server(80);
 
 // Fingerprint sensor
@@ -349,6 +357,8 @@ void drawHeader();
 void drawLights();
 void drawAudio();
 void drawSettings();
+void refreshSlavePumpStatus();
+bool initFingerprintSensor();
 void onDrag(int x);
 void pushZones();
 void applyHardwareGate(bool open);
@@ -1023,8 +1033,12 @@ void drawHeader() {
 
   // "Exit" tap zone — enlarged button with rounded corners
   if (gateState == GS_OPEN) {
-    tft.fillRoundRect(4, 3, 76, HDR_H - 6, 6, C_RED);
-    txt("Exit", 42, HDR_H / 2, 2, C_WHITE, C_RED, MC_DATUM);
+    const bool exitFocused = encoderMode != ENC_NAVIGATE &&
+                             encoderControl == ENC_CONTROL_EXIT;
+    const uint16_t exitColor = exitFocused ? C_FOCUS : C_RED;
+    tft.fillRoundRect(4, 3, 76, HDR_H - 6, 6, exitColor);
+    txt("Exit", 42, HDR_H / 2, 2, C_WHITE, exitColor, MC_DATUM);
+    drawEncoderFocusCue(4, 3, 76, HDR_H - 6, exitFocused);
   }
 
   // Park name (centred between Exit and tab buttons)
@@ -1159,17 +1173,15 @@ bool addUser(int fpID, const char* name) {
 bool deleteUser(int fpID) {
   for (int i = 0; i < userCount; i++) {
     if (users[i].id == fpID) {
+      if (!fpSensorAvailable && !initFingerprintSensor()) return false;
+      if (finger.deleteModel(fpID) != FINGERPRINT_OK) return false;
+
       // Shift remaining users
       for (int j = i; j < userCount - 1; j++) {
         users[j] = users[j + 1];
       }
       userCount--;
       saveUsers();
-      
-      // Delete from sensor
-      if (fpSensorAvailable) {
-        finger.deleteModel(fpID);
-      }
       
       Serial.printf("[FP] Deleted user ID #%d\n", fpID);
       return true;
@@ -1255,9 +1267,7 @@ void setupFingerprintSensor() {
 // Enroll new fingerprint
 // Returns: 0=success, 1=no finger, 2=error, 3=mismatch
 int enrollFingerprint(int id, int step) {
-  if (!fpSensorAvailable) {
-    if (!initFingerprintSensor()) return 2;
-  }
+  if (!fpSensorAvailable) return 2;
   
   if (step == 1) {
     // First capture
@@ -1345,6 +1355,9 @@ void drawGateScreen() {
       txt("Place your finger on the", cx, 148, 2, C_DIM, C_BG, MC_DATUM);
       txt("biometric scanner", cx, 178, 2, C_GREEN, C_BG, MC_DATUM);
       txt("to control your diorama.", cx, 208, 2, C_DIM, C_BG, MC_DATUM);
+      txt("Wi-Fi: Diorama-Park", cx, 252, 2, C_DIM, C_BG, MC_DATUM);
+      txt("Password: diorama123", cx, 276, 2, C_AMBER, C_BG, MC_DATUM);
+      txt("Web app: http://192.168.4.1", cx, 300, 2, C_GREEN, C_BG, MC_DATUM);
       break;
     }
     case GS_SCANNING: {
@@ -1597,9 +1610,13 @@ void drawColorPanel() {
   txt(hex, 44, py + 31, 2, C_TEXT, C_BG, TL_DATUM);
 
   if (colorScanMode) {
-    label(colorSensorAvailable ? "Captured color held; press Scan Color to update"
-                               : "Waiting for color sensor reading...",
-          SL_X0, py + 66);
+      label(colorSensorAvailable ? "Captured color held"
+             : "Waiting for color sensor reading...",
+        SL_X0, py + 66);
+      btn(315, py + 58, 145, 30, "SCAN COLOR", false, C_AMBER, 1);
+      drawFocusCue(315, py + 58, 145, 30, 8, false);
+      drawEncoderFocusCue(315, py + 58, 145, 30,
+          encoderControl == ENC_CONTROL_COLOR_SCAN);
     return;
   }
 
@@ -1755,36 +1772,47 @@ void drawSettings() {
   // Title
   txt("Settings", W / 2, BODY_Y + 14, 4, C_TEXT, C_BG, MC_DATUM);
 
-  // ── Drain Water card ───────────────────────────────────────────────────────
+    // ── Drain and intake pump cards ────────────────────────────────────────────
   int dy = BODY_Y + 44;
-  card(10, dy, 460, 48, C_CARD, drainagePumpOn ? C_GREEN : C_BORDER);
+    card(10, dy, 225, 48, C_CARD, drainagePumpOn ? C_GREEN : C_BORDER);
+    txt("Drain Pump", 20, dy + 10, 2, C_TEXT, C_CARD, TL_DATUM);
+    txt(drainagePumpOn ? "RUNNING" : "STOPPED", 20, dy + 30, 2,
+      drainagePumpOn ? C_GREEN : C_DIM, C_CARD, TL_DATUM);
+    const uint16_t drainOnFill = drainagePumpOn ? C_GREEN : C_CARD;
+    const uint16_t drainOffFill = !drainagePumpOn ? C_RED : C_CARD;
+    card(127, dy + 8, 46, 32, drainOnFill, drainagePumpOn ? C_GREEN : C_BORDER);
+    txt("ON", 150, dy + 24, 2, drainagePumpOn ? C_WHITE : C_TEXT, drainOnFill, MC_DATUM);
+    drawEncoderFocusCue(127, dy + 8, 46, 32, encoderControl == ENC_CONTROL_SETTINGS_DRAIN_ON);
+    card(181, dy + 8, 46, 32, drainOffFill, !drainagePumpOn ? C_RED : C_BORDER);
+    txt("OFF", 204, dy + 24, 2, !drainagePumpOn ? C_WHITE : C_TEXT, drainOffFill, MC_DATUM);
+    drawEncoderFocusCue(181, dy + 8, 46, 32, encoderControl == ENC_CONTROL_SETTINGS_DRAIN_OFF);
 
-  // Pump icon (simplified drop shape)
-  tft.fillCircle(36, dy + 24, 12, drainagePumpOn ? C_GREEN : C_TRACK);
-  tft.fillTriangle(28, dy + 22, 44, dy + 22, 36, dy + 10,
-                   drainagePumpOn ? C_GREEN : C_TRACK);
-
-  txt(drainagePumpOn ? "Drain: RUNNING" : "Drain: STOPPED",
-      58, dy + 10, 4, C_TEXT, C_CARD, TL_DATUM);
-  txt("Water drainage pump", 58, dy + 30, 2, C_DIM, C_CARD, TL_DATUM);
-
-  // ON / OFF buttons
-  uint16_t onFill  = drainagePumpOn  ? C_GREEN  : C_CARD;
-  uint16_t offFill = !drainagePumpOn ? C_RED    : C_CARD;
-  card(300, dy + 8, 64, 32, onFill,  drainagePumpOn  ? C_GREEN : C_BORDER);
-  txt("ON",  332, dy + 24, 2, drainagePumpOn  ? C_WHITE : C_TEXT, onFill,  MC_DATUM);
-  card(374, dy + 8, 64, 32, offFill, !drainagePumpOn ? C_RED   : C_BORDER);
-  txt("OFF", 406, dy + 24, 2, !drainagePumpOn ? C_WHITE : C_TEXT, offFill, MC_DATUM);
+    const bool intakeBlocked = !intakeWaterSensorAvailable || intakeWaterDetected;
+    const char* intakeStatus = !intakeWaterSensorAvailable ? "SENSOR OFFLINE"
+                             : intakeWaterDetected ? "WET - STOPPED"
+                             : intakePumpOn ? "RUNNING" : "STOPPED";
+    card(245, dy, 225, 48, C_CARD, intakePumpOn ? C_GREEN : intakeBlocked ? C_RED : C_BORDER);
+    txt("Intake Pump", 255, dy + 10, 2, C_TEXT, C_CARD, TL_DATUM);
+    txt(intakeStatus, 255, dy + 30, 2,
+      intakePumpOn ? C_GREEN : intakeBlocked ? C_RED : C_DIM, C_CARD, TL_DATUM);
+    const uint16_t intakeOnFill = intakePumpOn ? C_GREEN : intakeBlocked ? C_TRACK : C_CARD;
+    const uint16_t intakeOffFill = !intakePumpOn ? C_RED : C_CARD;
+    card(362, dy + 8, 46, 32, intakeOnFill, intakePumpOn ? C_GREEN : C_BORDER);
+    txt("ON", 385, dy + 24, 2, intakePumpOn ? C_WHITE : intakeBlocked ? C_DIM : C_TEXT, intakeOnFill, MC_DATUM);
+    drawEncoderFocusCue(362, dy + 8, 46, 32, encoderControl == ENC_CONTROL_SETTINGS_INTAKE_ON);
+    card(416, dy + 8, 46, 32, intakeOffFill, !intakePumpOn ? C_RED : C_BORDER);
+    txt("OFF", 439, dy + 24, 2, !intakePumpOn ? C_WHITE : C_TEXT, intakeOffFill, MC_DATUM);
+    drawEncoderFocusCue(416, dy + 8, 46, 32, encoderControl == ENC_CONTROL_SETTINGS_INTAKE_OFF);
 
   // ── Fingerprint Management ─────────────────────────────────────────────────
   label("Fingerprint Management", 20, BODY_Y + 104);
 
   // Sensor status
-  const char* status = fpSensorAvailable ? "Connected" : "Dummy Mode";
-  uint16_t statusColor = fpSensorAvailable ? C_GREEN : C_AMBER;
+  const char* status = fpSensorAvailable ? "Connected" : "Sensor Offline";
+  uint16_t statusColor = fpSensorAvailable ? C_GREEN : C_RED;
   txt(status, W / 2, BODY_Y + 120, 2, statusColor, C_BG, MC_DATUM);
 
-  // Enroll button
+  // Enrollment button
   card(40, BODY_Y + 136, 180, 40, C_GREEN, C_GREEN);
   txt("Enroll New", 130, BODY_Y + 156, 2, C_WHITE, C_GREEN, MC_DATUM);
   drawFocusCue(40, BODY_Y + 136, 180, 40, 1, true);
@@ -1830,6 +1858,7 @@ enum EnrollState { ENROLL_IDLE, ENROLL_STEP1, ENROLL_STEP1_WAIT, ENROLL_STEP2, E
 EnrollState enrollState = ENROLL_IDLE;
 int enrollingID = -1;
 uint32_t enrollStateMs = 0;
+char enrollmentErrorMessage[64] = "Fingerprint enrollment failed";
 
 void redrawCurrentPage() {
   drawHeader();
@@ -1840,6 +1869,7 @@ void redrawCurrentPage() {
 
 int getEncoderControls(EncoderControl* controls) {
   int count = 0;
+  controls[count++] = ENC_CONTROL_EXIT;
   if (page == P_LIGHTS) {
     controls[count++] = ENC_CONTROL_LIGHT_MODE;
     controls[count++] = ENC_CONTROL_LIGHT_POWER;
@@ -1848,7 +1878,9 @@ int getEncoderControls(EncoderControl* controls) {
     }
     if (tftMode == M_COLOR) {
       controls[count++] = ENC_CONTROL_COLOR_SOURCE;
-      if (!colorScanMode) {
+      if (colorScanMode) {
+        controls[count++] = ENC_CONTROL_COLOR_SCAN;
+      } else {
         controls[count++] = ENC_CONTROL_HUE;
         controls[count++] = ENC_CONTROL_SATURATION;
       }
@@ -1860,6 +1892,10 @@ int getEncoderControls(EncoderControl* controls) {
     controls[count++] = ENC_CONTROL_AUDIO_PLAY;
     controls[count++] = ENC_CONTROL_AUDIO_NEXT;
   } else {
+    controls[count++] = ENC_CONTROL_SETTINGS_DRAIN_ON;
+    controls[count++] = ENC_CONTROL_SETTINGS_DRAIN_OFF;
+    controls[count++] = ENC_CONTROL_SETTINGS_INTAKE_ON;
+    controls[count++] = ENC_CONTROL_SETTINGS_INTAKE_OFF;
     controls[count++] = ENC_CONTROL_SETTINGS_ENROLL;
     for (int i = 0; i < min(userCount, 6); i++) {
       controls[count++] = static_cast<EncoderControl>(ENC_CONTROL_SETTINGS_DELETE_0 + i);
@@ -1913,12 +1949,18 @@ void selectEncoderControl(EncoderControl control) {
 
 void activateEncoderControl() {
   switch (encoderControl) {
+    case ENC_CONTROL_EXIT:
+      enterGateState(GS_GOODBYE);
+      break;
     case ENC_CONTROL_COLOR_SOURCE:
       colorScanMode = !colorScanMode;
       updateColorSensorScanForMode();
-      if (colorScanMode) captureColorSensorColor();
       drawColorPanel();
       syncEncoderControlIndex();
+      break;
+    case ENC_CONTROL_COLOR_SCAN:
+      captureColorSensorColor();
+      drawColorPanel();
       break;
     case ENC_CONTROL_LIGHT_POWER:
       lightsOn = !lightsOn;
@@ -1941,6 +1983,28 @@ void activateEncoderControl() {
     case ENC_CONTROL_SETTINGS_ENROLL:
       startEnrollment();
       break;
+    case ENC_CONTROL_SETTINGS_DRAIN_ON:
+    case ENC_CONTROL_SETTINGS_DRAIN_OFF: {
+      const bool turnOn = encoderControl == ENC_CONTROL_SETTINGS_DRAIN_ON;
+      if (sendSlaveAudioCommand(turnOn ? "/pump?type=drain&state=on" : "/pump?type=drain&state=off")) {
+        drainagePumpOn = turnOn;
+      }
+      drawSettings();
+      break;
+    }
+    case ENC_CONTROL_SETTINGS_INTAKE_ON:
+    case ENC_CONTROL_SETTINGS_INTAKE_OFF: {
+      const bool turnOn = encoderControl == ENC_CONTROL_SETTINGS_INTAKE_ON;
+      if (turnOn && (!intakeWaterSensorAvailable || intakeWaterDetected)) {
+        Serial.println("[INTAKE] Start blocked: water sensor is wet or unavailable");
+      } else if (sendSlaveAudioCommand(turnOn ? "/pump?type=intake&state=on" : "/pump?type=intake&state=off")) {
+        intakePumpOn = turnOn;
+      } else if (turnOn) {
+        refreshSlavePumpStatus();
+      }
+      drawSettings();
+      break;
+    }
     default:
       if (encoderControl >= ENC_CONTROL_SETTINGS_DELETE_0 &&
           encoderControl <= ENC_CONTROL_SETTINGS_DELETE_5) {
@@ -1965,9 +2029,7 @@ void changePage(Page nextPage, int direction) {
 
   page = nextPage;
   encoderMode = ENC_NAVIGATE;
-  if (page == P_LIGHTS) encoderControl = ENC_CONTROL_BRIGHTNESS;
-  else if (page == P_AUDIO) encoderControl = ENC_CONTROL_AUDIO_PLAY;
-  else encoderControl = ENC_CONTROL_SETTINGS_ENROLL;
+  encoderControl = ENC_CONTROL_EXIT;
   syncEncoderControlIndex();
   redrawCurrentPage();
 }
@@ -2109,7 +2171,7 @@ void handleEncoderShortPress() {
   Serial.printf("[ENCODER] Mode: %s\n",
                 encoderMode == ENC_NAVIGATE ? "tab navigation"
                 : encoderMode == ENC_FOCUS ? "control selection" : "value adjustment");
-  if (enrollState == ENROLL_IDLE) redrawCurrentPage();
+  if (enrollState == ENROLL_IDLE && gateState == GS_OPEN) redrawCurrentPage();
 }
 
 void pollEncoder() {
@@ -2217,7 +2279,7 @@ void drawEnrollmentScreen() {
       tft.fillCircle(cx, 140, 40, C_RED);
       txt("✗", cx, 140, 7, C_WHITE, C_RED, MC_DATUM);
       txt("Error", cx, 200, 4, C_RED, C_BG, MC_DATUM);
-      txt("Fingerprints did not match", cx, 235, 2, C_TEXT, C_BG, MC_DATUM);
+      txt(enrollmentErrorMessage, cx, 235, 2, C_TEXT, C_BG, MC_DATUM);
       
       card(cx - 80, 260, 160, 40, C_PURPLE, C_PURPLE);
       txt("Try Again", cx, 280, 2, C_WHITE, C_PURPLE, MC_DATUM);
@@ -2229,12 +2291,20 @@ void drawEnrollmentScreen() {
 }
 
 void startEnrollment() {
+  if (!fpSensorAvailable && !initFingerprintSensor()) {
+    strlcpy(enrollmentErrorMessage, "Sensor offline; check wiring", sizeof(enrollmentErrorMessage));
+    enrollState = ENROLL_ERROR;
+    drawEnrollmentScreen();
+    return;
+  }
+
   enrollingID = findNextFreeID();
   if (enrollingID == -1) {
     Serial.println("[FP] All slots full!");
     return;
   }
   
+  strlcpy(enrollmentErrorMessage, "Fingerprint scan failed", sizeof(enrollmentErrorMessage));
   enrollState = ENROLL_STEP1;
   enrollStateMs = millis();
   drawEnrollmentScreen();
@@ -2279,6 +2349,9 @@ void pollEnrollment() {
       
     } else if (result == 2 || result == 3) {
       // Error or mismatch
+      if (result == 3) {
+        strlcpy(enrollmentErrorMessage, "Fingerprints did not match", sizeof(enrollmentErrorMessage));
+      }
       enrollState = ENROLL_ERROR;
       drawEnrollmentScreen();
     }
@@ -2729,7 +2802,8 @@ void onPress(int x, int y) {
     int dy = BODY_Y + 44;
 
     // Drain ON button
-    if (inRect(x, y, 300, dy + 8, 64, 32)) {
+    if (inRect(x, y, 127, dy + 8, 46, 32)) {
+      selectEncoderControl(ENC_CONTROL_SETTINGS_DRAIN_ON);
       if (sendSlaveAudioCommand("/pump?type=drain&state=on")) {
         drainagePumpOn = true;
       } else {
@@ -2739,11 +2813,40 @@ void onPress(int x, int y) {
       return;
     }
     // Drain OFF button
-    if (inRect(x, y, 374, dy + 8, 64, 32)) {
+    if (inRect(x, y, 181, dy + 8, 46, 32)) {
+      selectEncoderControl(ENC_CONTROL_SETTINGS_DRAIN_OFF);
       if (sendSlaveAudioCommand("/pump?type=drain&state=off")) {
         drainagePumpOn = false;
       } else {
         Serial.println("[DRAIN] ERROR: slave pump command failed");
+      }
+      drawSettings();
+      return;
+    }
+
+    // Intake ON / OFF buttons; the slave enforces the water-sensor interlock.
+    if (inRect(x, y, 362, dy + 8, 46, 32)) {
+      selectEncoderControl(ENC_CONTROL_SETTINGS_INTAKE_ON);
+      if (!intakeWaterSensorAvailable || intakeWaterDetected) {
+        Serial.println("[INTAKE] Start blocked: water sensor is wet or unavailable");
+        drawSettings();
+        return;
+      }
+      if (sendSlaveAudioCommand("/pump?type=intake&state=on")) {
+        intakePumpOn = true;
+      } else {
+        Serial.println("[INTAKE] ERROR: slave pump command failed or water interlock active");
+        refreshSlavePumpStatus();
+      }
+      drawSettings();
+      return;
+    }
+    if (inRect(x, y, 416, dy + 8, 46, 32)) {
+      selectEncoderControl(ENC_CONTROL_SETTINGS_INTAKE_OFF);
+      if (sendSlaveAudioCommand("/pump?type=intake&state=off")) {
+        intakePumpOn = false;
+      } else {
+        Serial.println("[INTAKE] ERROR: slave pump stop command failed");
       }
       drawSettings();
       return;
@@ -2845,7 +2948,6 @@ void onPress(int x, int y) {
         selectEncoderControl(ENC_CONTROL_COLOR_SOURCE);
         colorScanMode = true;
         updateColorSensorScanForMode();
-        captureColorSensorColor();
         drawColorPanel();
         syncEncoderControlIndex();
         return;
@@ -2856,6 +2958,12 @@ void onPress(int x, int y) {
         updateColorSensorScanForMode();
         drawColorPanel();
         syncEncoderControlIndex();
+        return;
+      }
+      if (colorScanMode && inRect(x, y, 315, py + 58, 145, 30)) {
+        selectEncoderControl(ENC_CONTROL_COLOR_SCAN);
+        captureColorSensorColor();
+        drawColorPanel();
         return;
       }
       if (!colorScanMode && inRect(x, y, SL_X0, py + 54, SL_X1 - SL_X0, 24)) {
@@ -3322,6 +3430,7 @@ void handleIntakePump() {
       intakePumpOn = false;
       intakeWaterDetected = true;
       intakeWaterSensorAvailable = true;
+      if (gateOpen && page == P_SETTINGS) drawSettings();
       server.send(statusCode, "application/json", response);
       return;
     }
@@ -3331,6 +3440,7 @@ void handleIntakePump() {
     return;
   }
   intakePumpOn = requestedState;
+  if (gateOpen && page == P_SETTINGS) drawSettings();
   Serial.printf("[INTAKE PUMP] %s on slave GPIO 27\n",
                 intakePumpOn ? "ON" : "OFF");
   server.send(200, "application/json",
@@ -3358,6 +3468,7 @@ void handleDrainagePump() {
   }
 
   drainagePumpOn = requestedState;
+  if (gateOpen && page == P_SETTINGS) drawSettings();
   Serial.printf("[DRAINAGE PUMP] %s on slave GPIO 33\n",
                 drainagePumpOn ? "ON" : "OFF");
   server.send(200, "application/json",
@@ -3625,14 +3736,19 @@ void handleMotor() {
 // ── GET /api/state  → full diorama state snapshot ────────────────────────────
 // The web app polls this every few seconds to sync changes made on the TFT.
 void refreshSlavePumpStatus() {
+  const bool wasAvailable = intakeWaterSensorAvailable;
+  const bool wasDetected = intakeWaterDetected;
+  const bool wasPumpOn = intakePumpOn;
+  const bool wasDrainagePumpOn = drainagePumpOn;
   String response;
   int statusCode = 0;
   if (!requestSlaveAudio("/status", response, statusCode)) {
     intakeWaterSensorAvailable = false;
+    if (wasAvailable && gateState == GS_OPEN && page == P_SETTINGS) drawSettings();
     return;
   }
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<1024> doc;
   if (deserializeJson(doc, response) ||
       !doc["waterSensorAvailable"].is<bool>() ||
       !doc["waterDetected"].is<bool>() ||
@@ -3643,6 +3759,7 @@ void refreshSlavePumpStatus() {
       lastStatusErrorMs = millis();
     }
     intakeWaterSensorAvailable = false;
+    if (wasAvailable && gateState == GS_OPEN && page == P_SETTINGS) drawSettings();
     return;
   }
 
@@ -3650,6 +3767,13 @@ void refreshSlavePumpStatus() {
   intakeWaterDetected = doc["waterDetected"].as<bool>();
   intakeWaterSensorAdc = doc["waterSensorAdc"].as<int>();
   intakePumpOn = doc["intakePumpOn"] | false;
+    drainagePumpOn = doc["drainagePumpOn"] | drainagePumpOn;
+  if ((wasAvailable != intakeWaterSensorAvailable ||
+      wasDetected != intakeWaterDetected || wasPumpOn != intakePumpOn ||
+      wasDrainagePumpOn != drainagePumpOn) &&
+      gateState == GS_OPEN && page == P_SETTINGS) {
+    drawSettings();
+  }
 }
 
 void handleState() {
@@ -3965,6 +4089,21 @@ void setupRoutes() {
   server.on("/api/fingerprint/enroll", HTTP_GET, []() { addCORSHeaders(); handleFingerprintEnroll(); });
   server.on("/api/fingerprint/delete", HTTP_GET, []() { addCORSHeaders(); handleFingerprintDelete(); });
 
+  auto redirectToPortal = []() {
+    const String portalUrl = String("http://") + WiFi.softAPIP().toString() + "/";
+    server.sendHeader("Location", portalUrl, true);
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(302, "text/plain", "");
+  };
+  server.on("/generate_204", HTTP_GET, redirectToPortal);
+  server.on("/gen_204", HTTP_GET, redirectToPortal);
+  server.on("/hotspot-detect.html", HTTP_GET, redirectToPortal);
+  server.on("/library/test/success.html", HTTP_GET, redirectToPortal);
+  server.on("/connecttest.txt", HTTP_GET, redirectToPortal);
+  server.on("/ncsi.txt", HTTP_GET, redirectToPortal);
+  server.on("/canonical.html", HTTP_GET, redirectToPortal);
+  server.on("/success.txt", HTTP_GET, redirectToPortal);
+
   // ── Static Web App Files (SPIFFS) ──────────────────────────────────────────
   server.serveStatic("/", SPIFFS, "/");
 
@@ -4229,14 +4368,19 @@ void setup() {
   txt("Starting WiFi AP...", W / 2, H / 2 - 20, 2, C_DIM, C_BG, MC_DATUM);
 
   WiFi.mode(WIFI_AP);
+  const IPAddress apIP(192, 168, 4, 1);
+  const IPAddress apSubnet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, apIP, apSubnet);
   // SoftAP can host phone/PC + slave ESP together (max 8 stations).
   // Sharing the hotspot is expected — it does NOT block the web app by itself.
   WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, 1 /*channel*/, 0 /*not hidden*/, 8 /*max conn*/);
   delay(500); // give AP time to start
 
-  IPAddress apIP = WiFi.softAPIP();
+  const IPAddress actualApIP = WiFi.softAPIP();
+  captiveDnsServer.start(53, "*", actualApIP);
   Serial.printf("[WiFi] AP started — SSID: %s  IP: %s  (phone + slave OK on same AP)\n",
-                WIFI_AP_SSID, apIP.toString().c_str());
+                WIFI_AP_SSID, actualApIP.toString().c_str());
+  Serial.println("[WiFi] Captive portal DNS started");
   Serial.println("[WiFi] Open web app at http://192.168.4.1");
 
   // Show connection info on TFT
@@ -4253,7 +4397,7 @@ void setup() {
 
   txt("Then set ESP32 IP in Settings to:", W / 2, 210, 2, C_DIM, C_BG, MC_DATUM);
   char ipLine[32];
-  snprintf(ipLine, sizeof(ipLine), "%s", apIP.toString().c_str());
+  snprintf(ipLine, sizeof(ipLine), "%s", actualApIP.toString().c_str());
   card(40, 228, 400, 36, C_AMBER, C_AMBER);
   txt(ipLine, W / 2, 246, 4, C_WHITE, C_AMBER, MC_DATUM);
 
@@ -4270,6 +4414,7 @@ void setup() {
 
 void loop() {
   // Serve web clients first so SoftAP stays responsive even if slave is flaky
+  captiveDnsServer.processNextRequest();
   server.handleClient();
 
   updateColorSensor();
@@ -4281,6 +4426,14 @@ void loop() {
 
   // Slave sync is fail-fast + backoff — never delay() here
   syncSlaveIfConnected();
+
+  static uint32_t lastTftPumpStatusMs = 0;
+  const uint32_t now = millis();
+  if (gateState == GS_OPEN && page == P_SETTINGS &&
+      now - lastTftPumpStatusMs >= 1000) {
+    lastTftPumpStatusMs = now;
+    refreshSlavePumpStatus();
+  }
 
   server.handleClient();
 

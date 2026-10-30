@@ -1,0 +1,191 @@
+.tft-preview-page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  padding: 32px 18px 40px;
+  background-color: #edf4ef;
+  background-image: linear-gradient(rgba(16, 150, 95, 0.055) 1px, transparent 1px), linear-gradient(90deg, rgba(16, 150, 95, 0.055) 1px, transparent 1px);
+  background-size: 24px 24px;
+  color: #14231e;
+  font-family: 'Space Grotesk', 'Trebuchet MS', sans-serif;
+}
+
+.tft-preview-heading,
+.tft-device,
+.tft-preview-controls {
+  width: min(880px, 100%);
+}
+
+.tft-preview-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tft-preview-eyebrow {
+  margin-bottom: 4px;
+  color: #557064;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.tft-preview-heading h1 {
+  font-size: 1.65rem;
+  line-height: 1.15;
+  font-weight: 700;
+}
+
+.tft-reset-button,
+.tft-simulate-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 42px;
+  padding: 0 15px;
+  border: 1px solid #b7cfc0;
+  border-radius: 8px;
+  background: #fff;
+  color: #173c2c;
+  font: inherit;
+  font-size: 0.88rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.tft-reset-button:hover,
+.tft-simulate-button.secondary:hover {
+  background: #f7fbf8;
+  border-color: #10965f;
+}
+
+.tft-device {
+  padding: 17px 18px 18px;
+  border: 1px solid #33443a;
+  border-radius: 12px;
+  background: linear-gradient(145deg, #27342d, #17221c);
+  box-shadow: 0 20px 50px rgba(24, 45, 33, 0.2), 0 3px 8px rgba(24, 45, 33, 0.16);
+}
+
+.tft-device-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 11px;
+  color: #c5d5cb;
+  font-size: 0.65rem;
+  font-weight: 700;
+}
+
+.tft-screen {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: hidden;
+  border: 2px solid #101813;
+  border-radius: 4px;
+  background: #f5faf7;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+.tft-hit-target {
+  cursor: pointer;
+}
+
+.tft-hit-target:focus-visible {
+  outline: 2px solid #06b6d4;
+  outline-offset: 1px;
+}
+
+.tft-range {
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.tft-range::-webkit-slider-runnable-track {
+  height: 8px;
+  background: transparent;
+}
+
+.tft-range::-moz-range-track {
+  height: 8px;
+  background: transparent;
+}
+
+.tft-range::-webkit-slider-thumb {
+  width: 24px;
+  height: 24px;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+}
+
+.tft-range::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  background: transparent;
+  opacity: 0;
+}
+
+.tft-range-hue::-webkit-slider-thumb {
+  background: hsl(var(--preview-hue, 36) 100% 50%);
+}
+
+.tft-range-sat::-webkit-slider-thumb {
+  background: var(--preview-color, #e68200);
+}
+
+.tft-preview-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  color: #5b7064;
+  font-size: 0.78rem;
+}
+
+.tft-simulate-button {
+  border-color: #087a4d;
+  background: #10965f;
+  color: white;
+}
+
+.tft-simulate-button:hover {
+  background: #087a4d;
+}
+
+.tft-simulate-button.secondary {
+  border-color: #b7cfc0;
+  background: white;
+  color: #173c2c;
+}
+
+@media (max-width: 560px) {
+  .tft-preview-page {
+    gap: 14px;
+    padding: 20px 10px 24px;
+  }
+
+  .tft-preview-heading h1 {
+    font-size: 1.35rem;
+  }
+
+  .tft-device {
+    padding: 10px;
+  }
+
+  .tft-preview-controls {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

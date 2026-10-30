@@ -158,8 +158,9 @@ function App() {
       });
     };
 
-    // When gate is waiting, poll fast (1000ms) for snappy response to physical fingerprint scan
-    const intervalTime = gateState === 'open' ? 3000 : 1000;
+    // Keep hardware changes from the TFT visible promptly in the web controls.
+    const intervalTime = 1000;
+    syncFromEsp32();
     pollTimer.current = setInterval(syncFromEsp32, intervalTime);
     return () => {
       clearInterval(pollTimer.current);

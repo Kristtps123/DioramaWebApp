@@ -1,4 +1,4 @@
-﻿import React, { useCallback } from 'react';
+﻿import { useCallback, useState } from 'react';
 import './ColorPicker.css';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -62,34 +62,51 @@ const PRESETS = [
 ];
 
 // ── Component ─────────────────────────────────────────────────────────────────
-export default function ColorPicker({ rgb, onChange, accentClass = 'amber' }) {
+export default function ColorPicker({ rgb, onChange }) {
   const { r, g, b } = rgb;
   const hex = rgbToHex(r, g, b);
-  const hsl = rgbToHsl(r, g, b);
+  const rgbHsl = rgbToHsl(r, g, b);
+  const [lastHue, setLastHue] = useState(rgbHsl.h);
+  const hsl = { ...rgbHsl, h: rgbHsl.s === 0 ? lastHue : rgbHsl.h };
+  const { h, s, l } = hsl;
 
   // Native color wheel changed
   const onNativeChange = useCallback((e) => {
-    onChange(hexToRgb(e.target.value));
+    const nextRgb = hexToRgb(e.target.value);
+    const nextHsl = rgbToHsl(nextRgb.r, nextRgb.g, nextRgb.b);
+    if (nextHsl.s > 0) setLastHue(nextHsl.h);
+    onChange(nextRgb);
   }, [onChange]);
 
   // Hue slider changed
   const onHueChange = useCallback((e) => {
-    const newHsl = { ...hsl, h: Number(e.target.value) };
-    onChange(hslToRgb(newHsl.h, newHsl.s, newHsl.l));
-  }, [hsl, onChange]);
+    const hue = Number(e.target.value);
+    setLastHue(hue);
+    onChange(hslToRgb(hue, s, l));
+  }, [s, l, onChange]);
 
   // Saturation slider
   const onSatChange = useCallback((e) => {
-    onChange(hslToRgb(hsl.h, Number(e.target.value), hsl.l));
-  }, [hsl, onChange]);
+    const saturation = Number(e.target.value);
+    const lightness = saturation > 0 && (l === 0 || l === 100) ? 50 : l;
+    onChange(hslToRgb(h, saturation, lightness));
+  }, [h, l, onChange]);
 
   // RGB number inputs
   const onRgbChange = (channel, val) => {
-    onChange({ r, g, b, [channel]: Math.max(0, Math.min(255, Number(val))) });
+    const nextRgb = { r, g, b, [channel]: Math.max(0, Math.min(255, Number(val))) };
+    const nextHsl = rgbToHsl(nextRgb.r, nextRgb.g, nextRgb.b);
+    if (nextHsl.s > 0) setLastHue(nextHsl.h);
+    onChange(nextRgb);
   };
 
   // Preset click
-  const onPreset = (presetHex) => onChange(hexToRgb(presetHex));
+  const onPreset = (presetHex) => {
+    const nextRgb = hexToRgb(presetHex);
+    const nextHsl = rgbToHsl(nextRgb.r, nextRgb.g, nextRgb.b);
+    if (nextHsl.s > 0) setLastHue(nextHsl.h);
+    onChange(nextRgb);
+  };
 
   return (
     <div className="cpk-root">
@@ -177,6 +194,7 @@ export default function ColorPicker({ rgb, onChange, accentClass = 'amber' }) {
           />
         ))}
       </div>
+
     </div>
   );
 }

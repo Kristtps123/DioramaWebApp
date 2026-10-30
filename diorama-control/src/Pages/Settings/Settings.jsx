@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Cpu, Sun, Mic, Fingerprint, RefreshCw, Plus, Trash2, Search, Radio, Droplets } from 'lucide-react';
 import { getLiveSensors, getFingerprintUsers, deleteFingerprintUser } from '../../services/esp32Api';
 import './Settings.css';
@@ -97,9 +97,10 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
   
   // Fingerprint management state
   const [fingerprintUsers, setFingerprintUsers] = useState([]);
-  const [isLoadingUsers, setIsLoadingUsers] = useState(false);
+  const [isLoadingUsers, setIsLoadingUsers] = useState(true);
   const [sensorAvailable, setSensorAvailable] = useState(true);
   const [userSearch, setUserSearch] = useState('');
+  const hasLoadedFingerprintUsers = useRef(false);
 
   const checkSensors = useCallback(async (manual = false) => {
     if (manual) setIsRefreshing(true);
@@ -120,19 +121,29 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
 
   // Fetch fingerprint users
   const loadFingerprintUsers = useCallback(async () => {
-    setIsLoadingUsers(true);
+    const showInitialLoading = !hasLoadedFingerprintUsers.current;
+    if (showInitialLoading) setIsLoadingUsers(true);
     try {
       const data = await getFingerprintUsers();
       if (data) {
-        setFingerprintUsers(data.users || []);
+        const nextUsers = Array.isArray(data.users) ? data.users : [];
+        setFingerprintUsers((currentUsers) => {
+          const unchanged = currentUsers.length === nextUsers.length &&
+            currentUsers.every((user, index) =>
+              user.id === nextUsers[index].id && user.name === nextUsers[index].name
+            );
+          return unchanged ? currentUsers : nextUsers;
+        });
         if (typeof data.sensorAvailable === 'boolean') {
           setSensorAvailable(data.sensorAvailable);
         }
+        hasLoadedFingerprintUsers.current = true;
       }
     } catch (error) {
       console.error('Failed to load fingerprint users:', error);
+    } finally {
+      if (showInitialLoading) setIsLoadingUsers(false);
     }
-    setIsLoadingUsers(false);
   }, []);
 
   // Delete user
