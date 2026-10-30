@@ -1,7 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
-import { Music, Play, Pause, Square, RefreshCw, AlertCircle, SkipBack, SkipForward } from 'lucide-react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { Music, Play, Pause, Square, RefreshCw, AlertCircle, SkipBack, SkipForward, Upload, Trash2, Volume2 } from 'lucide-react';
 import {
   getAudioFiles,
+  getAudioVolume,
+  uploadAudioFile,
+  deleteAudioFile,
+  sendAudioVolume,
   sendAudioPlay,
   sendAudioPause,
   sendAudioNext,
@@ -17,6 +21,13 @@ export default function Audio({ appState, setAppState, showToast }) {
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [deletingTrack, setDeletingTrack] = useState(null);
+  const [volume, setVolume] = useState(50);
+  const uploadInputRef = useRef(null);
+  const volumeDebounceRef = useRef(null);
+  const volumeChangedRef = useRef(false);
 
   // Strip directory prefix and extension for a friendlier display name
   const formatName = (filename) =>
@@ -57,10 +68,79 @@ export default function Audio({ appState, setAppState, showToast }) {
     };
   }, []);
 
+  useEffect(() => {
+    let isActive = true;
+    getAudioVolume().then((currentVolume) => {
+      if (isActive && currentVolume !== null && !volumeChangedRef.current) {
+        setVolume(currentVolume);
+      }
+    });
+
+    return () => {
+      isActive = false;
+      if (volumeDebounceRef.current) clearTimeout(volumeDebounceRef.current);
+    };
+  }, []);
+
+  const handleVolumeChange = (event) => {
+    const nextVolume = Number(event.target.value);
+    setVolume(nextVolume);
+    volumeChangedRef.current = true;
+    if (volumeDebounceRef.current) clearTimeout(volumeDebounceRef.current);
+    volumeDebounceRef.current = setTimeout(async () => {
+      const ok = await sendAudioVolume(nextVolume);
+      if (!ok) showToast('Could not change audio volume. Check the ESP32 connection.');
+    }, 180);
+  };
+
   const refreshTracks = () => {
     setLoading(true);
     setLoadFailed(false);
     void fetchTracks();
+  };
+
+  const handleAudioUpload = async (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    if (!/\.(mp3|wav)$/i.test(file.name)) {
+      showToast('Choose an MP3 or WAV file.');
+      return;
+    }
+
+    setUploading(true);
+    setUploadProgress(0);
+    const result = await uploadAudioFile(file, setUploadProgress);
+    setUploading(false);
+    if (!result.ok) {
+      showToast(result.error);
+      return;
+    }
+
+    showToast(`Uploaded ${file.name} to the SD card`);
+    setLoading(true);
+    await fetchTracks();
+  };
+
+  const handleAudioDelete = async (filename) => {
+    if (!window.confirm(`Delete "${formatName(filename)}" from the SD card? This cannot be undone.`)) {
+      return;
+    }
+
+    setDeletingTrack(filename);
+    const ok = await deleteAudioFile(filename);
+    setDeletingTrack(null);
+    if (!ok) {
+      showToast('Could not delete this track. Check the slave ESP32 connection and SD card.');
+      return;
+    }
+
+    setAppState((prev) => prev.audioTrack === filename
+      ? { ...prev, audioPlaying: false, audioTrack: 'No audio selected' }
+      : prev);
+    showToast(`Deleted ${formatName(filename)}`);
+    setLoading(true);
+    await fetchTracks();
   };
 
   const playTrack = async (filename) => {
@@ -152,16 +232,38 @@ export default function Audio({ appState, setAppState, showToast }) {
         <div className="section-block-header">
           <h2 className="section-block-title">SD Card Tracks</h2>
           <div className="audio-library-actions">
+            <input
+              ref={uploadInputRef}
+              className="audio-upload-input"
+              type="file"
+              accept=".mp3,.wav,audio/mpeg,audio/wav"
+              aria-label="Choose an MP3 or WAV file to upload"
+              onChange={handleAudioUpload}
+              disabled={uploading}
+            />
+            <button
+              className="audio-upload-button"
+              onClick={() => uploadInputRef.current?.click()}
+              disabled={uploading || loading}
+              title="Upload an MP3 or WAV file to the SD card"
+            >
+              <Upload size={16} />
+              <span>{uploading ? `Uploading ${uploadProgress}%` : 'Upload audio'}</span>
+            </button>
             <button
               className="btn-icon-refresh"
               onClick={refreshTracks}
               title="Refresh track list"
               aria-label="Refresh track list"
+              disabled={loading || uploading}
             >
               <RefreshCw size={16} className={loading ? 'spin' : ''} />
             </button>
           </div>
         </div>
+        <p className="audio-upload-hint">
+          MP3 or supported WAV only. Stop playback before uploading; your phone must be on the Diorama-Park Wi-Fi.
+        </p>
 
         <div className="audio-playback-controls" aria-label="Audio playback controls">
           <button
@@ -205,6 +307,22 @@ export default function Audio({ appState, setAppState, showToast }) {
           </button>
         </div>
 
+        <div className="audio-volume-control">
+          <Volume2 size={19} aria-hidden="true" />
+          <label htmlFor="audio-volume">Volume</label>
+          <input
+            id="audio-volume"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={volume}
+            onChange={handleVolumeChange}
+            aria-valuetext={`${volume}%`}
+          />
+          <output htmlFor="audio-volume">{volume}%</output>
+        </div>
+
         {loading && tracks.length === 0 && (
           <p className="audio-status-msg">Loading tracks from SD card…</p>
         )}
@@ -243,10 +361,21 @@ export default function Audio({ appState, setAppState, showToast }) {
                     <button
                       className="audio-play-circle-btn purple-play"
                       onClick={() => handlePlayToggle(filename)}
+                      disabled={uploading || deletingTrack !== null}
+                      aria-label={`${isPlaying ? 'Pause' : 'Play'} ${formatName(filename)}`}
                     >
                       {isPlaying
                         ? <Pause size={16} />
                         : <Play size={16} className="play-icon-offset" />}
+                    </button>
+                    <button
+                      className="audio-delete-button"
+                      onClick={() => void handleAudioDelete(filename)}
+                      disabled={uploading || deletingTrack !== null}
+                      title={`Stop playback and delete ${formatName(filename)}`}
+                      aria-label={`Delete ${formatName(filename)}`}
+                    >
+                      <Trash2 size={16} />
                     </button>
                   </div>
                 </div>

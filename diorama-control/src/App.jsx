@@ -56,6 +56,9 @@ function App() {
     fountainAuxStrength: 100,
     fountainForceSensorOn: false,
     intakePumpOn: false,
+    intakeWaterSensorAvailable: false,
+    intakeWaterDetected: false,
+    intakeWaterSensorAdc: 0,
     drainagePumpOn: false,
 
     fountainColor: '#77898D',
@@ -141,6 +144,9 @@ function App() {
         set('fountainAuxStrength', s.fountainAux);
         set('fountainForceSensorOn', s.fountainForceSensorOn);
         set('intakePumpOn',      s.intakePumpOn);
+        set('intakeWaterSensorAvailable', s.intakeWaterSensorAvailable);
+        set('intakeWaterDetected', s.intakeWaterDetected);
+        set('intakeWaterSensorAdc', s.intakeWaterSensorAdc);
         set('drainagePumpOn',   s.drainagePumpOn);
         set('audioPlaying',     s.audioPlaying);
         set('audioTrack',       s.audioTrack || 'No audio selected');

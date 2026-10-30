@@ -12,6 +12,8 @@
   ── Safe wiring ──────────────────────────────────────────────────────────────
   All groups share RGB inputs: R=GPIO4, G=GPIO22, B=GPIO32
   Force sensor            : analog output=GPIO36 (VP / ADC1)
+  Water sensor            : analog output=GPIO34 (ADC1); calibrate threshold below
+                            Keep the sensor output at or below 3.3 V.
   Intake pump driver      : control input=GPIO27
   Drain pump driver       : control input=GPIO33
 
@@ -38,9 +40,11 @@
   GET /motor?state=on|off&dir=fwd|rev
   GET /status
   GET /pump?type=intake|drain&state=on|off
-  GET /audio/files, /audio/state, /audio/play?file=..., /audio/pause,
-      /audio/next, /audio/previous
-  GET /audio/stop
+  Intake pump automatically stops and is blocked while water is detected.
+  GET /audio/files, /audio/state, /audio/volume[?value=0-100],
+      /audio/play?file=..., /audio/pause, /audio/next, /audio/previous
+  GET /audio/stop, /audio/delete?file=...
+  POST /audio/upload (multipart form field "audio", MP3/WAV)
 */
 
 #include <SdFat.h>
@@ -91,14 +95,25 @@ bool intakePumpOn = false;
 bool drainPumpOn = false;
 
 constexpr uint8_t FORCE_SENSOR_PIN = 36; // VP, ADC1 input-only pin
-constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 11025;
+constexpr uint8_t WATER_SENSOR_PIN = 34; // ADC1 input-only pin
+// Use the midpoint of measured dry/wet readings; set false if wet reads lower.
+constexpr int WATER_SENSOR_THRESHOLD = 2048;
+constexpr bool WATER_SENSOR_WET_WHEN_ABOVE_THRESHOLD = true;
+constexpr uint32_t WATER_SENSOR_SAMPLE_INTERVAL_MS = 100;
+constexpr uint8_t WATER_SENSOR_SAMPLE_COUNT = 8;
+int waterSensorAdc = 0;
+bool waterSensorDetected = false;
+uint32_t lastWaterSensorSampleMs = 0;
+constexpr uint32_t AUDIO_DEFAULT_SAMPLE_RATE_HZ = 22050;
 constexpr uint8_t AUDIO_OUTPUT_CHANNELS = 2;
-constexpr float AUDIO_FIXED_GAIN = 0.3f;
+constexpr float AUDIO_FIXED_GAIN = 0.5f;
+constexpr uint8_t AUDIO_DEFAULT_VOLUME_PERCENT = 50;
 constexpr float AUDIO_DIGITAL_BOOST = 0.7f; // About +3.5 dB; peaks are limited to 16-bit range.
 constexpr uint32_t AUDIO_WAV_BUFFER_BYTES = 4096;
 constexpr uint16_t AUDIO_DAC_BUFFER_BYTES = 2048;
 constexpr int AUDIO_I2S_DMA_BUFFER_COUNT = 16;
 uint32_t audioOutputSampleRateHz = AUDIO_DEFAULT_SAMPLE_RATE_HZ;
+volatile uint8_t audioVolumePercent = AUDIO_DEFAULT_VOLUME_PERCENT;
 
 constexpr uint8_t SD_SCK_PIN  = 18;
 constexpr uint8_t SD_MOSI_PIN = 23;
@@ -111,6 +126,7 @@ SPIClass sdSPI(VSPI);
 SdFs sd;
 bool sdCardReady = false;
 volatile bool audioCommandPending = false;
+volatile bool audioStopComplete = false;
 
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 class GainAdjustedInternalDAC : public AudioOutputInternalDAC {
@@ -253,12 +269,20 @@ portMUX_TYPE audioStateMux = portMUX_INITIALIZER_UNLOCKED;
 AudioFileSourceSdFat* audioSource = nullptr;
 AudioGenerator* audioDecoder = nullptr;
 AudioOutput* audioOutput = nullptr;
+FsFile audioUploadFile;
+String audioUploadPath;
+String audioUploadError;
+size_t audioUploadBytesWritten = 0;
+uint16_t audioUploadStatus = 400;
+bool audioUploadFileCreated = false;
+bool audioUploadInProgress = false;
 
 enum AudioCommandType : uint8_t {
   AUDIO_COMMAND_PLAY,
   AUDIO_COMMAND_PAUSE,
   AUDIO_COMMAND_STEP,
-  AUDIO_COMMAND_STOP
+  AUDIO_COMMAND_STOP,
+  AUDIO_COMMAND_VOLUME
 };
 
 struct AudioCommand {
@@ -270,6 +294,7 @@ QueueHandle_t audioCommandQueue = nullptr;
 volatile bool audioTaskRunning = false;
 
 void processAudioCommand(const AudioCommand& command);
+void addCORS();
 
 void setAudioState(int8_t track, bool playing) {
   portENTER_CRITICAL(&audioStateMux);
@@ -552,7 +577,7 @@ bool startAudioTrack(uint8_t index) {
   }
 
   if (!audioDecoder || !audioOutput ||
-      !audioOutput->SetGain(AUDIO_FIXED_GAIN) ||
+      !audioOutput->SetGain(audioVolumePercent / 100.0f) ||
       !audioDecoder->begin(audioSource, audioOutput)) {
     Serial.printf("[AUDIO] ERROR: decoder could not start for %s\n", audioTracks[index]);
     stopAudioDecoder();
@@ -579,6 +604,159 @@ String jsonQuoted(const char* value) {
   }
   escaped += '"';
   return escaped;
+}
+
+bool makeAudioUploadPath(const String& uploadedName, char* path, size_t pathSize) {
+  int basenameStart = max(uploadedName.lastIndexOf('/'), uploadedName.lastIndexOf('\\')) + 1;
+  const String filename = uploadedName.substring(basenameStart);
+  if (filename.isEmpty() || filename.length() > 80 ||
+      filename[0] == '.' || filename.endsWith(".") || filename.endsWith(" ")) {
+    return false;
+  }
+
+  for (size_t i = 0; i < filename.length(); ++i) {
+    const char ch = filename[i];
+    const bool allowed = (ch >= 'a' && ch <= 'z') ||
+                         (ch >= 'A' && ch <= 'Z') ||
+                         (ch >= '0' && ch <= '9') ||
+                         ch == ' ' || ch == '-' || ch == '_' ||
+                         ch == '.' || ch == '(' || ch == ')';
+    if (!allowed) return false;
+  }
+
+  String lowerName = filename;
+  lowerName.toLowerCase();
+  if (!lowerName.endsWith(".mp3") && !lowerName.endsWith(".wav")) return false;
+
+  const int written = snprintf(path, pathSize, "/DIORAMA/%s", filename.c_str());
+  return written > 0 && static_cast<size_t>(written) < pathSize;
+}
+
+void failAudioUpload(uint16_t status, const char* message) {
+  if (audioUploadError.length()) return;
+  audioUploadStatus = status;
+  audioUploadError = message;
+  if (audioUploadFile.isOpen()) audioUploadFile.close();
+  if (audioUploadFileCreated && audioUploadPath.length()) {
+    sd.remove(audioUploadPath.c_str());
+  }
+  audioUploadFileCreated = false;
+}
+
+void handleAudioUploadData() {
+  HTTPUpload& upload = server.upload();
+  switch (upload.status) {
+    case UPLOAD_FILE_START: {
+      audioUploadPath = "";
+      audioUploadError = "";
+      audioUploadBytesWritten = 0;
+      audioUploadStatus = 400;
+      audioUploadFileCreated = false;
+
+      if (!sdCardReady) {
+        failAudioUpload(503, "SD card is not mounted");
+        break;
+      }
+      if (audioUploadInProgress || audioDecoder || audioSource ||
+          pendingAudioTrack >= 0 ||
+          (audioCommandQueue && uxQueueMessagesWaiting(audioCommandQueue) > 0)) {
+        failAudioUpload(409, "Stop audio playback before uploading");
+        break;
+      }
+
+      char path[96];
+      if (!makeAudioUploadPath(upload.filename, path, sizeof(path))) {
+        failAudioUpload(400, "Use an MP3 or WAV filename with basic English characters");
+        break;
+      }
+      if (!sd.exists("/DIORAMA") && !sd.mkdir("/DIORAMA")) {
+        failAudioUpload(500, "Could not create the /DIORAMA folder");
+        break;
+      }
+
+      scanAudioTracks();
+      if (audioTrackCount >= MAX_AUDIO_TRACKS) {
+        failAudioUpload(409, "The playlist is full (maximum 24 tracks)");
+        break;
+      }
+      audioUploadPath = path;
+      if (sd.exists(audioUploadPath.c_str())) {
+        failAudioUpload(409, "A file with that name already exists");
+        break;
+      }
+      if (!audioUploadFile.open(&sd, audioUploadPath.c_str(),
+                                O_WRONLY | O_CREAT | O_EXCL)) {
+        failAudioUpload(507, "Could not create the file on the SD card");
+        break;
+      }
+
+      audioUploadFileCreated = true;
+      audioUploadInProgress = true;
+      Serial.printf("[AUDIO] Upload started: %s\n", audioUploadPath.c_str());
+      break;
+    }
+
+    case UPLOAD_FILE_WRITE:
+      if (!audioUploadError.length() && audioUploadFile.isOpen()) {
+        const size_t written = audioUploadFile.write(upload.buf, upload.currentSize);
+        audioUploadBytesWritten += written;
+        if (written != upload.currentSize) {
+          failAudioUpload(507, "SD card write failed or the card is full");
+        }
+      }
+      break;
+
+    case UPLOAD_FILE_END: {
+      if (audioUploadError.length() || !audioUploadFile.isOpen()) break;
+      audioUploadFile.flush();
+      if (!audioUploadFile.close()) {
+        failAudioUpload(507, "Could not finish writing the file");
+        break;
+      }
+      if (audioUploadBytesWritten == 0) {
+        failAudioUpload(400, "The selected audio file is empty");
+        break;
+      }
+      String lowerPath = audioUploadPath;
+      lowerPath.toLowerCase();
+      if (lowerPath.endsWith(".wav") &&
+          !validateWavFormat(audioUploadPath.c_str())) {
+        failAudioUpload(400, "WAV must be 8- or 16-bit PCM stereo at 22050 or 44100 Hz");
+        break;
+      }
+      scanAudioTracks();
+      audioUploadStatus = 201;
+      audioUploadFileCreated = false;
+      Serial.printf("[AUDIO] Upload complete: %s (%u bytes)\n",
+                    audioUploadPath.c_str(),
+                    static_cast<unsigned>(audioUploadBytesWritten));
+      break;
+    }
+
+    case UPLOAD_FILE_ABORTED:
+      failAudioUpload(400, "Upload was interrupted");
+      break;
+  }
+}
+
+void handleAudioUploadComplete() {
+  addCORS();
+  audioUploadInProgress = false;
+  if (audioUploadError.length()) {
+    String response = "{\"error\":";
+    response += jsonQuoted(audioUploadError.c_str());
+    response += "}";
+    server.send(audioUploadStatus, "application/json", response);
+    Serial.printf("[AUDIO] Upload failed: %s\n", audioUploadError.c_str());
+    return;
+  }
+
+  String response = "{\"ok\":true,\"file\":";
+  response += jsonQuoted(audioUploadPath.c_str());
+  response += ",\"bytes\":";
+  response += String(static_cast<unsigned long>(audioUploadBytesWritten));
+  response += "}";
+  server.send(201, "application/json", response);
 }
 
 void serviceAudioPlayback() {
@@ -631,7 +809,7 @@ void processAudioCommand(const AudioCommand& command) {
       const int8_t index = command.value;
       if (index < 0 || index >= audioTrackCount || pendingAudioTrack == index) return;
       if (currentAudioTrack == index && audioDecoder) {
-        if (!audioOutput || !audioOutput->SetGain(AUDIO_FIXED_GAIN)) {
+        if (!audioOutput || !audioOutput->SetGain(audioVolumePercent / 100.0f)) {
           Serial.println("[AUDIO] ERROR: could not restore audio output gain");
           return;
         }
@@ -681,8 +859,19 @@ void processAudioCommand(const AudioCommand& command) {
       pendingAudioTrack = -1;
       stopAudioDecoder();
       setAudioState(-1, false);
+      audioStopComplete = true;
       Serial.println("[AUDIO] Playback stopped");
       break;
+    case AUDIO_COMMAND_VOLUME: {
+      const uint8_t volume = static_cast<uint8_t>(command.value);
+      if (!audioOutput || !audioOutput->SetGain(volume / 100.0f)) {
+        Serial.printf("[AUDIO] ERROR: could not set volume to %u%%\n", volume);
+        return;
+      }
+      audioVolumePercent = volume;
+      Serial.printf("[AUDIO] Volume set to %u%%\n", audioVolumePercent);
+      break;
+    }
   }
 }
 
@@ -739,7 +928,8 @@ void allOff() {
 
 void addCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
 void handleRGB() {
@@ -763,8 +953,8 @@ void handleRGB() {
     String s = server.arg("sound");
     soundParam = (s == "1" || s.equalsIgnoreCase("true") || s.equalsIgnoreCase("on"));
   }
-  if (lightMode == "Sound" && soundParam) {
-    lastSoundDetectedMs = millis();
+  if (lightMode == "Sound") {
+    lastSoundDetectedMs = soundParam ? millis() : 0;
   }
 
   String grp = server.arg("group");
@@ -854,6 +1044,70 @@ void handleAudioFiles() {
   server.send(200, "application/json", json);
 }
 
+void handleAudioDelete() {
+  addCORS();
+  if (!sdCardReady) {
+    server.send(503, "application/json", "{\"error\":\"SD card is not mounted\"}");
+    return;
+  }
+  if (!server.hasArg("file")) {
+    server.send(400, "application/json", "{\"error\":\"missing file\"}");
+    return;
+  }
+  if (audioUploadInProgress) {
+    server.send(409, "application/json",
+                "{\"error\":\"Cannot delete a file while an upload is in progress\"}");
+    return;
+  }
+
+  const String requested = server.arg("file");
+  bool trackFound = false;
+  for (uint8_t i = 0; i < audioTrackCount; ++i) {
+    if (requested == audioTracks[i]) {
+      trackFound = true;
+      break;
+    }
+  }
+  if (!trackFound) {
+    server.send(404, "application/json", "{\"error\":\"track not found in /DIORAMA\"}");
+    return;
+  }
+
+  audioStopComplete = false;
+  if (!queueAudioCommand(AUDIO_COMMAND_STOP)) {
+    server.send(503, "application/json",
+                "{\"error\":\"audio command queue is full; could not stop playback\"}");
+    return;
+  }
+
+  const uint32_t stopStartedMs = millis();
+  while (!audioStopComplete && millis() - stopStartedMs < 2500) {
+    if (!audioTaskRunning) serviceAudioCommands();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  if (!audioStopComplete) {
+    server.send(503, "application/json",
+                "{\"error\":\"audio playback did not stop; file was not deleted\"}");
+    return;
+  }
+
+  if (!sd.remove(requested.c_str())) {
+    Serial.printf("[AUDIO] ERROR: could not delete %s (SD error code=0x%02X data=0x%02X)\n",
+                  requested.c_str(),
+                  sd.card() ? sd.card()->errorCode() : 0,
+                  sd.card() ? sd.card()->errorData() : 0);
+    server.send(500, "application/json", "{\"error\":\"Could not delete the file from the SD card\"}");
+    return;
+  }
+
+  scanAudioTracks();
+  Serial.printf("[AUDIO] Deleted: %s\n", requested.c_str());
+  String response = "{\"ok\":true,\"file\":";
+  response += jsonQuoted(requested.c_str());
+  response += "}";
+  server.send(200, "application/json", response);
+}
+
 void handleAudioState() {
   addCORS();
   int8_t track;
@@ -878,8 +1132,51 @@ void handleAudioState() {
   json += playing ? "true" : "false";
   json += ",\"trackCount\":";
   json += String(audioTrackCount);
+  json += ",\"volume\":";
+  json += String(audioVolumePercent);
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void handleAudioVolume() {
+  addCORS();
+  if (!server.hasArg("value")) {
+    String response = "{\"volume\":";
+    response += String(audioVolumePercent);
+    response += "}";
+    server.send(200, "application/json", response);
+    return;
+  }
+
+  const String requested = server.arg("value");
+  if (requested.isEmpty()) {
+    server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+    return;
+  }
+  for (size_t i = 0; i < requested.length(); ++i) {
+    if (requested[i] < '0' || requested[i] > '9') {
+      server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+      return;
+    }
+  }
+  const long volume = requested.toInt();
+  if (volume < 0 || volume > 100) {
+    server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+    return;
+  }
+  if (!audioOutput) {
+    server.send(503, "application/json", "{\"error\":\"audio output is not available\"}");
+    return;
+  }
+  if (!queueAudioCommand(AUDIO_COMMAND_VOLUME, static_cast<int8_t>(volume))) {
+    server.send(503, "application/json", "{\"error\":\"audio command queue is full\"}");
+    return;
+  }
+
+  String response = "{\"ok\":true,\"queued\":true,\"volume\":";
+  response += String(volume);
+  response += "}";
+  server.send(202, "application/json", response);
 }
 
 void handlePump() {
@@ -895,6 +1192,15 @@ void handlePump() {
   const bool enabled = server.arg("state") == "on";
   const bool intake = server.arg("type") == "intake";
   const uint8_t pin = intake ? INTAKE_PUMP_PIN : DRAIN_PUMP_PIN;
+  if (intake && enabled && waterSensorDetected) {
+    digitalWrite(INTAKE_PUMP_PIN, LOW);
+    intakePumpOn = false;
+    addCORS();
+    server.send(409, "application/json",
+                "{\"error\":\"water detected; intake pump is blocked\",\"waterDetected\":true,\"on\":false}");
+    return;
+  }
+
   digitalWrite(pin, enabled ? HIGH : LOW);
   if (intake) intakePumpOn = enabled;
   else drainPumpOn = enabled;
@@ -995,11 +1301,12 @@ void handleAudioStop() {
 
 void handleStatus() {
   addCORS();
-  char buf[720];
+  char buf[800];
   snprintf(buf, sizeof(buf),
     "{\"connected\":%s,\"ip\":\"%s\",\"mode\":\"%s\",\"ssid\":\"%s\","
     "\"motorRunning\":%s,\"sdCardReady\":%s,"
     "\"intakePumpOn\":%s,\"drainagePumpOn\":%s,"
+    "\"waterSensorAvailable\":true,\"waterDetected\":%s,\"waterSensorAdc\":%d,"
     "\"groups\":["
     "{\"id\":1,\"r\":%d,\"g\":%d,\"b\":%d,\"brightness\":%d,\"on\":%s},"
     "{\"id\":2,\"r\":%d,\"g\":%d,\"b\":%d,\"brightness\":%d,\"on\":%s},"
@@ -1013,6 +1320,8 @@ void handleStatus() {
     sdCardReady ? "true" : "false",
     intakePumpOn ? "true" : "false",
     drainPumpOn ? "true" : "false",
+    waterSensorDetected ? "true" : "false",
+    waterSensorAdc,
     groups[0].r, groups[0].g, groups[0].b, groups[0].brightness, groups[0].on ? "true" : "false",
     groups[1].r, groups[1].g, groups[1].b, groups[1].brightness, groups[1].on ? "true" : "false",
     groups[2].r, groups[2].g, groups[2].b, groups[2].brightness, groups[2].on ? "true" : "false"
@@ -1033,12 +1342,15 @@ void startHttpServer() {
   server.on("/pump",   HTTP_GET,     handlePump);
   server.on("/status", HTTP_GET,     handleStatus);
   server.on("/audio/files", HTTP_GET, handleAudioFiles);
+  server.on("/audio/delete", HTTP_GET, handleAudioDelete);
   server.on("/audio/state", HTTP_GET, handleAudioState);
+  server.on("/audio/volume", HTTP_GET, handleAudioVolume);
   server.on("/audio/play", HTTP_GET, handleAudioPlay);
   server.on("/audio/pause", HTTP_GET, handleAudioPause);
   server.on("/audio/next", HTTP_GET, []() { handleAudioStep(1); });
   server.on("/audio/previous", HTTP_GET, []() { handleAudioStep(-1); });
   server.on("/audio/stop", HTTP_GET, handleAudioStop);
+  server.on("/audio/upload", HTTP_POST, handleAudioUploadComplete, handleAudioUploadData);
   server.on("/rgb",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/off",    HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/motor",  HTTP_OPTIONS, []() { addCORS(); server.send(204); });
@@ -1046,11 +1358,13 @@ void startHttpServer() {
   server.on("/status", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/files", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/state", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
+  server.on("/audio/volume", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/play", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/pause", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/next", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/previous", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.on("/audio/stop", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
+  server.on("/audio/upload", HTTP_OPTIONS, []() { addCORS(); server.send(204); });
   server.begin();
   httpStarted = true;
   Serial.printf("[HTTP] Listening on http://%s/status\n", WiFi.localIP().toString().c_str());
@@ -1110,9 +1424,22 @@ void setup() {
   Serial.println("[PUMP] Intake and drain outputs ready, both OFF");
 
   pinMode(FORCE_SENSOR_PIN, INPUT);
+  pinMode(WATER_SENSOR_PIN, INPUT);
   analogReadResolution(12);
   analogSetPinAttenuation(FORCE_SENSOR_PIN, ADC_11db);
+  analogSetPinAttenuation(WATER_SENSOR_PIN, ADC_11db);
   Serial.println("[FORCE SENSOR] Analog input ready on GPIO36 (VP)");
+  for (uint8_t sample = 0; sample < WATER_SENSOR_SAMPLE_COUNT; ++sample) {
+    waterSensorAdc += analogRead(WATER_SENSOR_PIN);
+  }
+  waterSensorAdc /= WATER_SENSOR_SAMPLE_COUNT;
+  waterSensorDetected = WATER_SENSOR_WET_WHEN_ABOVE_THRESHOLD
+      ? waterSensorAdc >= WATER_SENSOR_THRESHOLD
+      : waterSensorAdc <= WATER_SENSOR_THRESHOLD;
+  lastWaterSensorSampleMs = millis();
+  Serial.printf("[WATER SENSOR] Analog input ready on GPIO34: ADC=%d, threshold=%d, detected=%s\n",
+                waterSensorAdc, WATER_SENSOR_THRESHOLD,
+                waterSensorDetected ? "yes" : "no");
 
   pinMode(SD_CS_PIN, OUTPUT);
   digitalWrite(SD_CS_PIN, HIGH);
@@ -1176,7 +1503,7 @@ void setup() {
       delete audioOutput;
       audioOutput = nullptr;
     } else {
-      audioOutput->SetGain(AUDIO_FIXED_GAIN);
+      audioOutput->SetGain(AUDIO_DEFAULT_VOLUME_PERCENT / 100.0f);
       Serial.printf("[AUDIO] Internal DAC ready on GPIO25/26; default=%lu Hz stereo, digital boost %.2fx\n",
                     static_cast<unsigned long>(AUDIO_DEFAULT_SAMPLE_RATE_HZ),
                     AUDIO_DIGITAL_BOOST);
@@ -1200,6 +1527,30 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t now = millis();
+  if (now - lastWaterSensorSampleMs >= WATER_SENSOR_SAMPLE_INTERVAL_MS) {
+    lastWaterSensorSampleMs = now;
+    uint32_t sampleTotal = 0;
+    for (uint8_t sample = 0; sample < WATER_SENSOR_SAMPLE_COUNT; ++sample) {
+      sampleTotal += analogRead(WATER_SENSOR_PIN);
+    }
+    waterSensorAdc = sampleTotal / WATER_SENSOR_SAMPLE_COUNT;
+
+    const bool detected = WATER_SENSOR_WET_WHEN_ABOVE_THRESHOLD
+        ? waterSensorAdc >= WATER_SENSOR_THRESHOLD
+        : waterSensorAdc <= WATER_SENSOR_THRESHOLD;
+    if (detected != waterSensorDetected) {
+      waterSensorDetected = detected;
+      Serial.printf("[WATER SENSOR] ADC=%d water=%s\n",
+                    waterSensorAdc, waterSensorDetected ? "detected" : "clear");
+      if (waterSensorDetected && intakePumpOn) {
+        digitalWrite(INTAKE_PUMP_PIN, LOW);
+        intakePumpOn = false;
+        Serial.println("[PUMP] Intake stopped: water detected");
+      }
+    }
+  }
+
   if (httpStarted) server.handleClient();
   if (!audioTaskRunning && audioCommandQueue) {
     serviceAudioCommands();
@@ -1207,8 +1558,6 @@ void loop() {
   }
 
   const bool connected = (WiFi.status() == WL_CONNECTED);
-  const unsigned long now = millis();
-
   // ── Inner circle sound-reactive rotation ─────────────────────────
   if (!manualMotorRunning && lightMode == "Sound" &&
       lastSoundDetectedMs != 0 && now - lastSoundDetectedMs < SOUND_MOTOR_HOLD_MS) {

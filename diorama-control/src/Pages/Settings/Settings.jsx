@@ -258,6 +258,7 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
               type="button"
               className={`drainage-pump-toggle ${appState.intakePumpOn ? 'is-on' : ''}`}
               aria-pressed={appState.intakePumpOn}
+              disabled={appState.intakeWaterDetected && !appState.intakePumpOn}
               onClick={() => setAppState({ intakePumpOn: !appState.intakePumpOn })}
             >
               {appState.intakePumpOn ? 'Turn OFF' : 'Turn ON'}
@@ -266,6 +267,13 @@ export default function SettingsPage({ appState, setAppState, showToast, onOpenR
           <p className="card-description-subtext">
             Switches the intake pump driver input on the slave ESP32. Connect the pump through a suitable
             motor driver or relay module; do not power the pump from GPIO 27.
+          </p>
+          <p className="card-description-subtext" role="status">
+            {appState.intakeWaterDetected
+              ? `Water detected${appState.intakeWaterSensorAvailable ? ` (ADC ${appState.intakeWaterSensorAdc})` : ''}; intake pump stopped and cannot be started.`
+              : appState.intakeWaterSensorAvailable
+                ? `Water sensor clear (ADC ${appState.intakeWaterSensorAdc}).`
+                : 'Water sensor status unavailable.'}
           </p>
           <div className={`drainage-pump-status ${appState.intakePumpOn ? 'is-on' : ''}`} role="status">
             Intake pump · Slave GPIO 27: {appState.intakePumpOn ? 'ON' : 'OFF'}

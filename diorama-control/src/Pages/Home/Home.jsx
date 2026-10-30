@@ -149,7 +149,7 @@ export default function Home({ appState, setAppState, setActiveTab, showToast, o
                 }))}
               />
               <span className="card-status-subtext">
-                Sets how strongly the microphone responds to sound.
+                0% disables sound triggers; higher sensitivity reacts to quieter sounds.
               </span>
             </div>
           )}

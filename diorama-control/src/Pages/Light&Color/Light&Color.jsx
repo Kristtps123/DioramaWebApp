@@ -270,7 +270,7 @@ export default function LightAndColor({ appState, setAppState, showToast }) {
                 }))}
               />
               <span className="card-status-subtext">
-                Sets how strongly the microphone responds to sound.
+                0% disables sound triggers; higher sensitivity reacts to quieter sounds.
               </span>
             </div>
           </div>

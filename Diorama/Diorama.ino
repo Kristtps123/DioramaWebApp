@@ -47,6 +47,8 @@
   GET /api/audio/pause
   GET /api/audio/stop
   GET /api/audio/files                          → {"files":["/DIORAMA/001.mp3",...]}
+  GET /api/audio/delete?file=/DIORAMA/001.mp3
+  GET /api/audio/volume[?value=0-100]
   Note: Audio endpoints proxy to the slave ESP32 and return an error if it is unavailable.
   GET /api/sound-reactive?state=on|off&intensity=0-100
   GET /api/sound                                → {"detected":bool,"level":0-1023}
@@ -251,6 +253,9 @@ bool    forceSensorOn = false;
 int     manualFountainStr = 100;
 int     forceSensorLevel = 0; // Nonlinear sensor level normalized to 0-1023 for the web UI.
 bool    intakePumpOn = false;
+bool    intakeWaterSensorAvailable = false;
+bool    intakeWaterDetected = false;
+int     intakeWaterSensorAdc = 0;
 bool    drainagePumpOn = false;
 
 int fountainPumpDuty() {
@@ -315,6 +320,7 @@ int micPeakToPeak = 0;
 int micRms = 0;
 int micLevel = 0;
 bool micDetected = false;
+bool soundMutedBySensitivity = false;
 uint32_t micLastSampleMs = 0;
 uint32_t micLastLogMs = 0;
 
@@ -2301,6 +2307,7 @@ void updateMicSensor() {
     micLevel = 0;
     micDetected = false;
     lvl = 0;
+    soundMutedBySensitivity = false;
     return;
   }
 
@@ -2334,14 +2341,15 @@ void updateMicSensor() {
   micLevel = constrain(map(micPeakToPeak, 0, 900, 0, 1023), 0, 1023);
 
   const int detectionThreshold = max(8, 90 - sens * 7 / 10);
-  micDetected = micRms >= detectionThreshold;
+  micDetected = sens > 0 && micRms >= detectionThreshold;
 
   if (now - micLastLogMs >= 500) {
     micLastLogMs = now;
-    Serial.printf("[SOUND] GPIO%d min=%d max=%d p-p=%d rms=%d level=%d/1023 detected=%s threshold=%d\n",
+    Serial.printf("[SOUND] GPIO%d min=%d max=%d p-p=%d rms=%d level=%d/1023 detected=%s sensitivity=%d%% enabled=%s threshold=%d\n",
                   MIC_PIN,
                   micRawMin, micRawMax, micPeakToPeak, micRms, micLevel,
-                  micDetected ? "yes" : "no", detectionThreshold);
+                  micDetected ? "yes" : "no", sens,
+                  sens > 0 ? "yes" : "no", detectionThreshold);
   }
 }
 
@@ -2356,8 +2364,22 @@ void updateLive() {
     if (innerCircleMotorRunning) {
       stopMotors();
     }
+    soundMutedBySensitivity = false;
     return;
   }
+
+  if (sens == 0) {
+    micDetected = false;
+    lvl = 0;
+    if (!soundMutedBySensitivity) {
+      lastSoundDetectedMs = 0;
+      stopMotors();
+      pushZones();
+      soundMutedBySensitivity = true;
+    }
+    return;
+  }
+  soundMutedBySensitivity = false;
 
   if (micDetected && micLevel > 0) {
     lvl     = max(micLevel / 1023.0f, lvl * 0.82f);
@@ -2390,7 +2412,8 @@ void updateLive() {
 // AUDIO HELPERS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bool requestSlaveAudio(const String& endpoint, String& body, int& statusCode) {
+bool requestSlaveAudio(const String& endpoint, String& body, int& statusCode,
+                       uint16_t timeoutMs = 800) {
   WiFiClient client;
   HTTPClient http;
   const String url = "http://192.168.4.200" + endpoint;
@@ -2400,7 +2423,7 @@ bool requestSlaveAudio(const String& endpoint, String& body, int& statusCode) {
     return false;
   }
   http.setConnectTimeout(300);
-  http.setTimeout(800);
+  http.setTimeout(timeoutMs);
   http.addHeader("Connection", "close");
 
   const int responseCode = http.GET();
@@ -2480,6 +2503,10 @@ void refreshSlaveAudioTracks() {
 }
 
 void syncSlaveAudioState() {
+  // Keep blocking audio-state HTTP requests out of the sound-reactive loop:
+  // mic sampling and the slave's motor heartbeat are time-sensitive there.
+  if (lightMode == "Sound Reactive") return;
+
   const uint32_t now = millis();
   if (now - lastSlaveAudioSyncMs < 3000) return;
   lastSlaveAudioSyncMs = now;
@@ -3063,6 +3090,23 @@ void handleMode() {
 
 // ── GET /api/color?r=&g=&b=&target=left|right|center|all ────────────────────
 void handleColor() {
+  if (server.hasArg("mode")) {
+    String requestedMode = server.arg("mode");
+    requestedMode.replace("+", " ");
+    if (requestedMode != "Colorful" && requestedMode != "Custom Color") {
+      server.send(400, "application/json",
+                  "{\"error\":\"color mode must be Colorful or Custom Color\"}");
+      return;
+    }
+
+    lightMode = "Colorful";
+    tftMode = M_COLOR;
+    soundReactive = false;
+    stopMotors();
+    updateColorSensorScanForMode();
+    syncEncoderControlIndex();
+  }
+
   // Basic = locked white. Sound/Adaptive own their output. Only Custom Color accepts picks.
   if (lightMode == "Basic") {
     Serial.println("[HTTP /api/color] Ignored — Basic mode is locked to white");
@@ -3271,12 +3315,21 @@ void handleIntakePump() {
   const bool requestedState = server.arg("state") == "on";
   const String endpoint = String("/pump?type=intake&state=") +
                           (requestedState ? "on" : "off");
-  if (!sendSlaveAudioCommand(endpoint)) {
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio(endpoint, response, statusCode)) {
+    if (statusCode == 409) {
+      intakePumpOn = false;
+      intakeWaterDetected = true;
+      intakeWaterSensorAvailable = true;
+      server.send(statusCode, "application/json", response);
+      return;
+    }
     server.send(503, "application/json",
-                "{\"error\":\"slave ESP32 unavailable; intake pump command failed\"}");
+                response.length() ? response.c_str()
+                                  : "{\"error\":\"slave ESP32 unavailable; intake pump command failed\"}");
     return;
   }
-
   intakePumpOn = requestedState;
   Serial.printf("[INTAKE PUMP] %s on slave GPIO 27\n",
                 intakePumpOn ? "ON" : "OFF");
@@ -3446,6 +3499,85 @@ void handleAudioFiles() {
   server.send(statusCode, "application/json", response);
 }
 
+// ── GET /api/audio/delete?file=/DIORAMA/xxx.mp3 ───────────────────────────────
+void handleAudioDelete() {
+  if (!server.hasArg("file")) {
+    server.send(400, "application/json", "{\"error\":\"missing file\"}");
+    return;
+  }
+  if (!slaveAudioReachable || !sdOk) refreshSlaveAudioTracks();
+  if (!slaveAudioReachable || !sdOk) {
+    server.send(503, "application/json",
+                "{\"error\":\"slave SD/audio controller unavailable\"}");
+    return;
+  }
+
+  const String requested = server.arg("file");
+  int index = -1;
+  for (int i = 0; i < trackCount; ++i) {
+    if (requested == trackPath[i]) {
+      index = i;
+      break;
+    }
+  }
+  if (index < 0) {
+    server.send(404, "application/json", "{\"error\":\"track not found in slave /DIORAMA playlist\"}");
+    return;
+  }
+
+  const String endpoint = "/audio/delete?file=" + encodeAudioPath(trackPath[index]);
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio(endpoint, response, statusCode, 3500)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
+    return;
+  }
+
+  if (audioStarted && curTrack == index) {
+    audioPlaying = false;
+    audioStarted = false;
+    curTrack = -1;
+  }
+  Serial.printf("[AUDIO] Deleted track from slave SD card: %s\n", requested.c_str());
+  refreshSlaveAudioTracks();
+  if (page == P_AUDIO && gateState == GS_OPEN) drawAudio();
+  server.send(statusCode, "application/json", response);
+}
+
+// ── GET /api/audio/volume[?value=0-100] ───────────────────────────────────────
+void handleAudioVolume() {
+  String endpoint = "/audio/volume";
+  if (server.hasArg("value")) {
+    const String requested = server.arg("value");
+    if (requested.isEmpty()) {
+      server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+      return;
+    }
+    for (size_t i = 0; i < requested.length(); ++i) {
+      if (requested[i] < '0' || requested[i] > '9') {
+        server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+        return;
+      }
+    }
+    const long volume = requested.toInt();
+    if (volume < 0 || volume > 100) {
+      server.send(400, "application/json", "{\"error\":\"volume must be an integer from 0 to 100\"}");
+      return;
+    }
+    endpoint += "?value=" + String(volume);
+  }
+
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio(endpoint, response, statusCode)) {
+    server.send(statusCode ? statusCode : 503, "application/json",
+                response.length() ? response : "{\"error\":\"slave audio controller unavailable\"}");
+    return;
+  }
+  server.send(statusCode, "application/json", response);
+}
+
 // ── GET /api/sound-reactive?state=on|off&intensity=0-100 ─────────────────────
 void handleSoundReactive() {
   if (server.hasArg("state"))     soundReactive   = (server.arg("state") == "on");
@@ -3492,7 +3624,37 @@ void handleMotor() {
 
 // ── GET /api/state  → full diorama state snapshot ────────────────────────────
 // The web app polls this every few seconds to sync changes made on the TFT.
+void refreshSlavePumpStatus() {
+  String response;
+  int statusCode = 0;
+  if (!requestSlaveAudio("/status", response, statusCode)) {
+    intakeWaterSensorAvailable = false;
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, response) ||
+      !doc["waterSensorAvailable"].is<bool>() ||
+      !doc["waterDetected"].is<bool>() ||
+      !doc["waterSensorAdc"].is<int>()) {
+    static uint32_t lastStatusErrorMs = 0;
+    if (millis() - lastStatusErrorMs >= 5000) {
+      Serial.println("[WATER SENSOR] ERROR: invalid status response from slave ESP32");
+      lastStatusErrorMs = millis();
+    }
+    intakeWaterSensorAvailable = false;
+    return;
+  }
+
+  intakeWaterSensorAvailable = doc["waterSensorAvailable"].as<bool>();
+  intakeWaterDetected = doc["waterDetected"].as<bool>();
+  intakeWaterSensorAdc = doc["waterSensorAdc"].as<int>();
+  intakePumpOn = doc["intakePumpOn"] | false;
+}
+
 void handleState() {
+  if (gateOpen) refreshSlavePumpStatus();
+
   // Zone colour hex strings
   char leftHex[8], rightHex[8], centerHex[8];
   snprintf(leftHex,   sizeof(leftHex),   "#%02X%02X%02X", zone[0].r, zone[0].g, zone[0].b);
@@ -3509,7 +3671,7 @@ void handleState() {
   char modeEsc[48];
   strlcpy(modeEsc, lightMode.c_str(), sizeof(modeEsc));
 
-  char json[640];
+  char json[800];
   snprintf(json, sizeof(json),
     "{"
     "\"gateOpen\":%s,"
@@ -3523,6 +3685,9 @@ void handleState() {
     "\"fountainAux\":%d,"
     "\"fountainForceSensorOn\":%s,"
     "\"intakePumpOn\":%s,"
+    "\"intakeWaterSensorAvailable\":%s,"
+    "\"intakeWaterDetected\":%s,"
+    "\"intakeWaterSensorAdc\":%d,"
     "\"drainagePumpOn\":%s,"
     "\"audioPlaying\":%s,"
     "\"audioTrack\":\"%s\","
@@ -3542,6 +3707,9 @@ void handleState() {
     fountainAux,
     forceSensorOn  ? "true" : "false",
     intakePumpOn   ? "true" : "false",
+    intakeWaterSensorAvailable ? "true" : "false",
+    intakeWaterDetected ? "true" : "false",
+    intakeWaterSensorAdc,
     drainagePumpOn ? "true" : "false",
     audioPlaying   ? "true" : "false",
     trackName,
@@ -3754,6 +3922,8 @@ void setupRoutes() {
   server.on("/api/audio/previous",   HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/stop",       HTTP_OPTIONS, handleOptions);
   server.on("/api/audio/files",      HTTP_OPTIONS, handleOptions);
+  server.on("/api/audio/delete",     HTTP_OPTIONS, handleOptions);
+  server.on("/api/audio/volume",     HTTP_OPTIONS, handleOptions);
   server.on("/api/sound-reactive",   HTTP_OPTIONS, handleOptions);
   server.on("/api/sound",            HTTP_OPTIONS, handleOptions);
   server.on("/api/motor",            HTTP_OPTIONS, handleOptions);
@@ -3782,6 +3952,8 @@ void setupRoutes() {
   server.on("/api/audio/previous", HTTP_GET, []() { addCORSHeaders(); handleAudioStep(-1); });
   server.on("/api/audio/stop",  HTTP_GET, []() { addCORSHeaders(); handleAudioStop();  });
   server.on("/api/audio/files", HTTP_GET, []() { addCORSHeaders(); handleAudioFiles(); });
+  server.on("/api/audio/delete", HTTP_GET, []() { addCORSHeaders(); handleAudioDelete(); });
+  server.on("/api/audio/volume", HTTP_GET, []() { addCORSHeaders(); handleAudioVolume(); });
   server.on("/api/sound-reactive",HTTP_GET,[]() { addCORSHeaders(); handleSoundReactive(); });
   server.on("/api/sound",  HTTP_GET, []() { addCORSHeaders(); handleSound();        });
   server.on("/api/motor",  HTTP_GET, []() { addCORSHeaders(); handleMotor();        });

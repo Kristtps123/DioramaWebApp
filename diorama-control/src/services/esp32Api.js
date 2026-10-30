@@ -10,7 +10,7 @@ export const setEsp32Ip = (ip) => {
 };
 
 // Generic fetch sender with fallback handling
-const sendEspCommand = async (endpoint, params = {}) => {
+const sendEspCommand = async (endpoint, params = {}, timeoutMs = 3000) => {
   const queryString = new URLSearchParams(params).toString();
   // If app is served directly from ESP32, use relative URL; otherwise connect to esp32Ip
   const isSelfHosted = window.location.hostname === esp32Ip || (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1');
@@ -20,7 +20,7 @@ const sendEspCommand = async (endpoint, params = {}) => {
 
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     const response = await fetch(url, {
       method: 'GET',
@@ -76,7 +76,7 @@ export const sendColorControl = (hexColor, target = 'left') => {
   const g = parseInt(cleanHex.substring(2, 4), 16) || 0;
   const b = parseInt(cleanHex.substring(4, 6), 16) || 0;
 
-  return sendEspCommand('/api/color', { r, g, b, target });
+  return sendEspCommand('/api/color', { r, g, b, target, mode: 'Colorful' });
 };
 
 export const sendColorScanMode = (scanEnabled) => {
@@ -201,6 +201,46 @@ export const getAudioFiles = async () => {
   }
 };
 
+export const uploadAudioFile = (file, onProgress = () => {}) => new Promise((resolve) => {
+  const formData = new FormData();
+  formData.append('audio', file, file.name);
+  const request = new XMLHttpRequest();
+  request.open('POST', 'http://192.168.4.200/audio/upload');
+  request.timeout = 120000;
+  request.upload.onprogress = (event) => {
+    if (event.lengthComputable) {
+      onProgress(Math.round((event.loaded / event.total) * 100));
+    }
+  };
+  request.onload = () => {
+    const response = (() => {
+      try {
+        return JSON.parse(request.responseText);
+      } catch {
+        return null;
+      }
+    })();
+    if (request.status >= 200 && request.status < 300) {
+      resolve({ ok: true, file: response?.file });
+    } else {
+      resolve({
+        ok: false,
+        error: response?.error || `Upload failed (HTTP ${request.status})`
+      });
+    }
+  };
+  request.onerror = () => resolve({
+    ok: false,
+    error: 'Could not reach the slave ESP32. Connect your phone to the Diorama-Park Wi-Fi.'
+  });
+  request.ontimeout = () => resolve({
+    ok: false,
+    error: 'Upload timed out. Check the Wi-Fi connection and try again.'
+  });
+  request.onabort = () => resolve({ ok: false, error: 'Upload was cancelled.' });
+  request.send(formData);
+});
+
 /**
  * Tell the ESP32 to play a specific track by filename.
  * Sends: GET /api/audio/play?file=<filename>
@@ -223,6 +263,35 @@ export const sendAudioPrevious = () => sendEspCommand('/api/audio/previous');
  * Tell the ESP32 to stop playback.
  */
 export const sendAudioStop = () => sendEspCommand('/api/audio/stop');
+
+/**
+ * Delete a stopped audio track from the slave SD card.
+ */
+export const deleteAudioFile = (filename) =>
+  sendEspCommand('/api/audio/delete', { file: filename }, 6000);
+
+export const getAudioVolume = async () => {
+  const isSelfHosted =
+    window.location.hostname === esp32Ip ||
+    (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1');
+  const url = isSelfHosted ? '/api/audio/volume' : `http://${esp32Ip}/api/audio/volume`;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    const response = await fetch(url, { signal: controller.signal, mode: 'cors' });
+    clearTimeout(timeoutId);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return Number.isInteger(data.volume) && data.volume >= 0 && data.volume <= 100
+      ? data.volume
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+export const sendAudioVolume = (volume) =>
+  sendEspCommand('/api/audio/volume', { value: volume });
 
 // ── Sensor reads ──────────────────────────────────────────────────────────────
 
