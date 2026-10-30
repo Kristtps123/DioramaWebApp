@@ -13,10 +13,7 @@
 }
 
 .tft-preview-heading,
-.tft-device,
-.tft-preview-controls {
-  width: min(880px, 100%);
-}
+.tft-devic
 
 .tft-preview-heading {
   display: flex;
